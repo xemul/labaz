@@ -32,9 +32,16 @@ add_subdirectory (seastar EXCLUDE_FROM_ALL)
 # The server.
 #
 
+find_package (RapidJSON REQUIRED)
+find_package (GnuTLS REQUIRED)
+
 add_executable (labaz
   src/main.cc
-  src/http_frontend.cc)
+  src/storage.cc
+  src/registry.cc
+  src/http_frontend.cc
+  src/native/native_facade.cc
+  src/potato/potato_storage.cc)
 
 target_include_directories (labaz
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -43,7 +50,10 @@ target_compile_options (labaz
   PRIVATE -Wall -Werror)
 
 target_link_libraries (labaz
-  PRIVATE Seastar::seastar)
+  PRIVATE
+    Seastar::seastar
+    RapidJSON
+    GnuTLS::GnuTLS)
 
 #
 # Tests.

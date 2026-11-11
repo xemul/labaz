@@ -4,7 +4,8 @@ An object storage server that speaks the S3 and GCS protocols, built on
 [Seastar](https://github.com/scylladb/seastar). See
 [object-storage-design.md](object-storage-design.md) for the design.
 
-At this stage it is a skeleton: an HTTP(S) server with no routes.
+At this stage it serves only the testing-only [native facade](docs/native-protocol.md)
+on top of the [potato backend](docs/backends.md).
 
 ## Building
 
@@ -22,13 +23,22 @@ The presets use clang and put the build into `build/<preset>/`.
 ## Running
 
 ```sh
-build/dev/labaz --smp 2 -m 1G \
-    --http-port 8080 \
-    --https-port 8443 --tls-cert cert.pem --tls-key key.pem
+build/dev/labaz --smp 1 -m 1G \
+    --backend potato --data-dir /var/tmp/labaz \
+    --facade native:http=8080,https=8443 --tls-cert cert.pem --tls-key key.pem
 ```
 
-At least one of `--http-port` and `--https-port` is required. Once
-listening, the server prints a `labaz: listening ...` line to stdout. It stops
+- `--facade <name>:http=<port>,https=<port>,address=<addr>` serves one
+  protocol; it can be repeated, and all facades share the same storage. At
+  least one port per facade is required; `address` defaults to
+  `--listen-address` (127.0.0.1). HTTPS ports use `--tls-cert`/`--tls-key`.
+- `--backend <name>` selects the storage; see [docs/backends.md](docs/backends.md).
+- `--help` lists the available facades and backends with their options.
+
+Run it with `--smp 1` for now: requests are not yet routed between shards,
+and the storage serves each call on the shard that receives it.
+
+Once all facades listen, the server prints `labaz: ready` to stdout. It stops
 on SIGINT or SIGTERM.
 
 ## Testing
@@ -42,6 +52,17 @@ python3 -m pytest test --labaz=build/dev/labaz
 ```
 
 They need `pytest`, `requests` and the `openssl` command.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/storage.hh` | The storage (backend) interface and neutral error codes |
+| `src/facade.hh` | The facade (protocol) interface |
+| `src/registry.cc` | The list of built-in backends and facades |
+| `src/potato/` | The potato backend |
+| `src/native/` | The native facade |
+| `src/http_frontend.*` | Per-facade HTTP(S) servers on all shards |
 
 ## License
 

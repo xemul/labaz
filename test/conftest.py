@@ -11,8 +11,9 @@ from pathlib import Path
 
 import pytest
 
-DEFAULT_SEASTAR_ARGS = ["--smp", "2", "-m", "512M", "--overprovisioned"]
-READY_LINE = "labaz: listening"
+# A single shard: routing requests between shards is not there yet.
+DEFAULT_SEASTAR_ARGS = ["--smp", "1", "-m", "512M", "--overprovisioned"]
+READY_LINE = "labaz: ready"
 START_TIMEOUT = 30
 STOP_TIMEOUT = 30
 
@@ -49,6 +50,17 @@ def tls_cert(tmp_path_factory) -> tuple[Path, Path]:
     return cert, key
 
 
+def seastar_args(args: list[str]) -> list[str]:
+    """DEFAULT_SEASTAR_ARGS, except for options that `args` sets itself."""
+    ret = []
+    it = iter(DEFAULT_SEASTAR_ARGS)
+    for opt in it:
+        value = next(it) if not opt.startswith("--overprovisioned") else None
+        if opt not in args:
+            ret += [opt] if value is None else [opt, value]
+    return ret
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -62,17 +74,19 @@ class LabazServer:
     def __init__(self, binary: Path, workdir: Path, args: list[str]):
         self.binary = binary
         self.args = args
+        self.workdir = workdir
         self.log_path = workdir / "labaz.log"
         self.proc: subprocess.Popen | None = None
 
     def start(self):
-        log = open(self.log_path, "w")
-        self.proc = subprocess.Popen([str(self.binary), *DEFAULT_SEASTAR_ARGS, *self.args],
+        log = open(self.log_path, "a")
+        log_start = log.tell()
+        self.proc = subprocess.Popen([str(self.binary), *seastar_args(self.args), *self.args],
                                      stdout=log, stderr=subprocess.STDOUT)
         log.close()
         deadline = time.monotonic() + START_TIMEOUT
         while time.monotonic() < deadline:
-            if READY_LINE in self.log():
+            if READY_LINE in self.log()[log_start:]:
                 return
             if self.proc.poll() is not None:
                 raise RuntimeError(f"labaz exited with {self.proc.returncode} before "
@@ -101,13 +115,17 @@ class LabazServer:
 @pytest.fixture
 def run_labaz(labaz_binary, tmp_path):
     """Factory: run_labaz(args) starts a server with the given extra
-    arguments and returns it. Every server still running at the end of the
-    test is stopped and must exit cleanly."""
+    arguments and returns it. Unless the arguments name a --data-dir, the
+    server gets one in its work directory. Every server still running at
+    the end of the test is stopped and must exit cleanly."""
     servers = []
 
     def start(args: list[str]) -> LabazServer:
-        server = LabazServer(labaz_binary, tmp_path / f"server{len(servers)}", args)
-        server.log_path.parent.mkdir()
+        workdir = tmp_path / f"server{len(servers)}"
+        workdir.mkdir()
+        if "--data-dir" not in args:
+            args = [*args, "--data-dir", str(workdir / "data")]
+        server = LabazServer(labaz_binary, workdir, args)
         servers.append(server)
         server.start()
         return server
@@ -123,7 +141,7 @@ def run_labaz(labaz_binary, tmp_path):
 @pytest.fixture
 def http_url(run_labaz) -> str:
     port = free_port()
-    run_labaz(["--http-port", str(port)])
+    run_labaz(["--facade", f"native:http={port}"])
     return f"http://127.0.0.1:{port}"
 
 
@@ -131,5 +149,14 @@ def http_url(run_labaz) -> str:
 def https_url(run_labaz, tls_cert) -> str:
     cert, key = tls_cert
     port = free_port()
-    run_labaz(["--https-port", str(port), "--tls-cert", str(cert), "--tls-key", str(key)])
+    run_labaz(["--facade", f"native:https={port}", "--tls-cert", str(cert), "--tls-key", str(key)])
     return f"https://127.0.0.1:{port}"
+
+
+@pytest.fixture
+def native(http_url):
+    """A client of a fresh server, with a bucket named 'bkt' created."""
+    from native_client import NativeClient
+    c = NativeClient(http_url)
+    c.create_bucket("bkt")
+    return c

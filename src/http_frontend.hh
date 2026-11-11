@@ -15,9 +15,14 @@
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/tls.hh>
 
+#include "facade.hh"
+
 namespace labaz {
 
 struct http_frontend_config {
+    sstring facade;
+    // Unique among the frontends; names the server's metrics.
+    sstring name;
     seastar::net::inet_address address;
     std::optional<uint16_t> http_port;
     std::optional<uint16_t> https_port;
@@ -26,18 +31,18 @@ struct http_frontend_config {
     std::optional<seastar::tls::credentials_builder> tls;
 };
 
-/// The HTTP(S) server, one instance per shard, all listening on the same
-/// addresses. Serves no routes yet.
+/// The HTTP(S) server of one facade, one instance per shard, all listening
+/// on the same addresses.
 class http_frontend {
     seastar::sharded<seastar::httpd::http_server> _servers;
     std::vector<seastar::socket_address> _http_addresses;
     std::vector<seastar::socket_address> _https_addresses;
 
 public:
-    /// Starts the servers on all shards and listens on the configured
-    /// ports. On failure the servers are stopped before the error is
-    /// returned.
-    seastar::future<> start(http_frontend_config cfg);
+    /// Starts the servers on all shards, installs the facade's routes and
+    /// listens on the configured ports. On failure the servers are stopped
+    /// before the error is returned.
+    seastar::future<> start(http_frontend_config cfg, seastar::sharded<facade_service>& facade);
 
     /// Stops listening and waits for in-flight connections to finish.
     seastar::future<> stop();

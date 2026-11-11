@@ -158,7 +158,8 @@ the rules.
 - **Flat key namespace.** Deleting the last object under a prefix must not
   affect later writes under that prefix. The Versity gateway breaks this
   (SCYLLADB-5060); the harness works around it by creating a placeholder
-  object named `sstables/`.
+  object named `sstables/`. Labaz does not support keys ending in `/`, so the
+  harness must drop that placeholder (section 7.2).
 - **Zero-length objects.** Scylla's `refs/nodes/{host}/{gen}` reference
   markers are empty.
 - **Replace on write.** Writing to an existing key replaces the object
@@ -286,6 +287,12 @@ meta "seal" file that enumerates them. Reading an object consults that file.
 
 ### 6.2 Backend upload API (Decided in outline; signatures Proposed)
 
+The `facade_private` data below was dropped from the implemented storage API
+(`src/storage.hh`): it only serves S3 ETags. Where the S3 facade keeps part
+and object ETags is open: reserved user-metadata entries, checksums computed
+by the storage for any facade, or recomputing them when needed (e.g. reading
+the parts at CompleteMultipartUpload).
+
 ```cpp
 // One per upload. The id is durable before it is returned.
 future<session_id> open_session(bucket, key, object_attrs);
@@ -372,6 +379,10 @@ The first backend is deliberately simple: it works on individual files and
 maps object names to filesystem names in the simplest way that works, even
 1-1. (Decided)
 
+It is implemented as the "potato" backend; its current layout and limits are
+in `docs/backends.md`. It does not yet do the session recovery described
+below.
+
 ### 7.1 Session layout and restart recovery (Proposed)
 
 ```
@@ -423,6 +434,9 @@ directory sync.
 
 ### 7.2 Name mapping: what the simple scheme must still handle
 
+> Superseded in potato: an object is a directory named by the SHA-1 of its
+> key, which sidesteps the issues below (see `docs/backends.md`).
+
 - **An object is a directory** holding `object.meta` and part files. Internal
   names need a reserved marker so they cannot collide with a key component.
 - **Empty parent directories.** Removing a parent when its last object goes
@@ -430,7 +444,9 @@ directory sync.
   parents or retry the create.
 - **Keys ending in a slash.** The harness creates a placeholder object named
   `sstables/`. Either accept such keys or drop that workaround from the
-  harness for this storage.
+  harness for this storage. Chosen: keys ending in `/` are not supported (for
+  now); the harness drops the placeholder, which this storage does not need
+  since it never removes parent directories. (Decided)
 
 ### 7.3 Documented limits of this backend
 

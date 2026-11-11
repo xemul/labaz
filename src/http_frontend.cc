@@ -11,8 +11,8 @@ namespace labaz {
 
 using namespace seastar;
 
-future<> http_frontend::start(http_frontend_config cfg) {
-    co_await _servers.start(sstring("labaz"));
+future<> http_frontend::start(http_frontend_config cfg, sharded<facade_service>& facade) {
+    co_await _servers.start(cfg.name);
 
     std::exception_ptr ex;
     try {
@@ -21,6 +21,9 @@ future<> http_frontend::start(http_frontend_config cfg) {
             // can be arbitrarily large.
             s.set_content_streaming(true);
             s.set_server_header(sstring("Labaz"));
+        });
+        co_await _servers.invoke_on_all([&facade] (httpd::http_server& s) {
+            facade.local().get().set_routes(s._routes);
         });
 
         if (cfg.http_port) {
