@@ -7,7 +7,7 @@
 // their per-shard instances.
 
 #include "facade.hh"
-#include "native/native_facade.hh"
+#include "plywood/plywood_facade.hh"
 #include "potato/potato_storage.hh"
 #include "storage.hh"
 
@@ -31,7 +31,7 @@ const backend_type* find_backend_type(std::string_view name) {
 
 const std::vector<facade_type>& facade_types() {
     static const std::vector<facade_type> types = {
-        native::make_facade_type(),
+        plywood::make_facade_type(),
     };
     return types;
 }

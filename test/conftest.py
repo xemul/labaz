@@ -141,7 +141,7 @@ def run_labaz(labaz_binary, tmp_path):
 @pytest.fixture
 def http_url(run_labaz) -> str:
     port = free_port()
-    run_labaz(["--facade", f"native:http={port}"])
+    run_labaz(["--facade", f"plywood:http={port}"])
     return f"http://127.0.0.1:{port}"
 
 
@@ -149,14 +149,14 @@ def http_url(run_labaz) -> str:
 def https_url(run_labaz, tls_cert) -> str:
     cert, key = tls_cert
     port = free_port()
-    run_labaz(["--facade", f"native:https={port}", "--tls-cert", str(cert), "--tls-key", str(key)])
+    run_labaz(["--facade", f"plywood:https={port}", "--tls-cert", str(cert), "--tls-key", str(key)])
     return f"https://127.0.0.1:{port}"
 
 
 @pytest.fixture
-def native(http_url):
+def plywood(http_url):
     """A client of a fresh server, with a bucket named 'bkt' created."""
-    from native_client import NativeClient
-    c = NativeClient(http_url)
+    from plywood_client import PlywoodClient
+    c = PlywoodClient(http_url)
     c.create_bucket("bkt")
     return c

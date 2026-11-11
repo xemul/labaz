@@ -1,21 +1,21 @@
 # Copyright (C) 2026 The Labaz Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""A client for the native facade (docs/native-protocol.md)."""
+"""A client for the plywood facade (docs/plywood-protocol.md)."""
 
 from urllib.parse import quote
 
 import requests
 
 
-class NativeError(Exception):
+class PlywoodError(Exception):
     def __init__(self, status: int, code: str, message: str):
         super().__init__(f"{status} {code}: {message}")
         self.status = status
         self.code = code
 
 
-class NativeClient:
+class PlywoodClient:
     def __init__(self, url: str, **kwargs):
         self.url = url
         self.s = requests.Session()
@@ -26,9 +26,9 @@ class NativeClient:
         if r.status_code >= 400:
             try:
                 err = r.json()
-                raise NativeError(r.status_code, err["error"], err["message"])
+                raise PlywoodError(r.status_code, err["error"], err["message"])
             except (ValueError, KeyError):
-                raise NativeError(r.status_code, "", r.text)
+                raise PlywoodError(r.status_code, "", r.text)
         return r
 
     @staticmethod

@@ -4,7 +4,7 @@ An object storage server that speaks the S3 and GCS protocols, built on
 [Seastar](https://github.com/scylladb/seastar). See
 [object-storage-design.md](object-storage-design.md) for the design.
 
-At this stage it serves only the testing-only [native facade](docs/native-protocol.md)
+At this stage it serves only the testing-only [plywood facade](docs/plywood-protocol.md)
 on top of the [potato backend](docs/backends.md).
 
 ## Building
@@ -25,7 +25,7 @@ The presets use clang and put the build into `build/<preset>/`.
 ```sh
 build/dev/labaz --smp 1 -m 1G \
     --backend potato --data-dir /var/tmp/labaz \
-    --facade native:http=8080,https=8443 --tls-cert cert.pem --tls-key key.pem
+    --facade plywood:http=8080,https=8443 --tls-cert cert.pem --tls-key key.pem
 ```
 
 - `--facade <name>:http=<port>,https=<port>,address=<addr>` serves one
@@ -61,7 +61,7 @@ They need `pytest`, `requests` and the `openssl` command.
 | `src/facade.hh` | The facade (protocol) interface |
 | `src/registry.cc` | The list of built-in backends and facades |
 | `src/potato/` | The potato backend |
-| `src/native/` | The native facade |
+| `src/plywood/` | The plywood facade |
 | `src/http_frontend.*` | Per-facade HTTP(S) servers on all shards |
 
 ## License

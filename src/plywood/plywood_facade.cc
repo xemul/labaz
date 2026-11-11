@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// The protocol is described in docs/native-protocol.md.
+// The protocol is described in docs/plywood-protocol.md.
 
-#include "native/native_facade.hh"
+#include "plywood/plywood_facade.hh"
 
 #include <charconv>
 #include <ranges>
@@ -20,7 +20,7 @@
 #include <seastar/http/handlers.hh>
 #include <seastar/http/matchrules.hh>
 
-namespace labaz::native {
+namespace labaz::plywood {
 
 using namespace seastar;
 using reply = http::reply;
@@ -273,7 +273,7 @@ static future<> send_data(input_stream<char> in, output_stream<char>& out) {
 //
 
 // Runs a request and renders storage and request errors as JSON replies.
-class native_handler final : public httpd::handler_base {
+class plywood_handler final : public httpd::handler_base {
 public:
     using func_type = std::function<future<std::unique_ptr<reply>>(request&, std::unique_ptr<reply>)>;
 
@@ -281,7 +281,7 @@ private:
     func_type _func;
 
 public:
-    explicit native_handler(func_type func) : _func(std::move(func)) {}
+    explicit plywood_handler(func_type func) : _func(std::move(func)) {}
 
     future<std::unique_ptr<reply>> handle(const sstring&, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
         try {
@@ -294,36 +294,36 @@ public:
     }
 };
 
-class native_facade final : public facade {
+class plywood_facade final : public facade {
     storage& _storage;
 
 public:
-    explicit native_facade(storage& s) : _storage(s) {}
+    explicit plywood_facade(storage& s) : _storage(s) {}
 
     void set_routes(httpd::routes& r) override {
         using enum httpd::operation_type;
 
-        r.put(GET, "/", handler(&native_facade::list_buckets));
+        r.put(GET, "/", handler(&plywood_facade::list_buckets));
 
         // Bucket rules go first: an object rule would match a bare bucket
         // path too, with an empty key.
-        r.add(bucket_rule(&native_facade::list_objects), GET);
-        r.add(bucket_rule(&native_facade::create_bucket), PUT);
-        r.add(bucket_rule(&native_facade::delete_bucket), DELETE);
+        r.add(bucket_rule(&plywood_facade::list_objects), GET);
+        r.add(bucket_rule(&plywood_facade::create_bucket), PUT);
+        r.add(bucket_rule(&plywood_facade::delete_bucket), DELETE);
 
-        r.add(object_rule(&native_facade::get_object_or_session), GET);
-        r.add(object_rule(&native_facade::head_object), HEAD);
-        r.add(object_rule(&native_facade::put_object_or_session), PUT);
-        r.add(object_rule(&native_facade::delete_object_or_session), DELETE);
-        r.add(object_rule(&native_facade::open_session), POST);
-        r.add(object_rule(&native_facade::commit_session), PATCH);
+        r.add(object_rule(&plywood_facade::get_object_or_session), GET);
+        r.add(object_rule(&plywood_facade::head_object), HEAD);
+        r.add(object_rule(&plywood_facade::put_object_or_session), PUT);
+        r.add(object_rule(&plywood_facade::delete_object_or_session), DELETE);
+        r.add(object_rule(&plywood_facade::open_session), POST);
+        r.add(object_rule(&plywood_facade::commit_session), PATCH);
     }
 
 private:
-    using method = future<std::unique_ptr<reply>> (native_facade::*)(request&, std::unique_ptr<reply>);
+    using method = future<std::unique_ptr<reply>> (plywood_facade::*)(request&, std::unique_ptr<reply>);
 
-    native_handler* handler(method m) {
-        return new native_handler([this, m] (request& req, std::unique_ptr<reply> rep) {
+    plywood_handler* handler(method m) {
+        return new plywood_handler([this, m] (request& req, std::unique_ptr<reply> rep) {
             return (this->*m)(req, std::move(rep));
         });
     }
@@ -564,13 +564,13 @@ private:
 
 facade_type make_facade_type() {
     return facade_type{
-        .name = "native",
+        .name = "plywood",
         .description = "Testing-only HTTP/JSON protocol mapping 1:1 to the storage API",
         .add_options = [] (bpo::options_description&) {},
         .make = [] (const bpo::variables_map&, storage& s) -> std::unique_ptr<facade> {
-            return std::make_unique<native_facade>(s);
+            return std::make_unique<plywood_facade>(s);
         },
     };
 }
 
-} // namespace labaz::native
+} // namespace labaz::plywood

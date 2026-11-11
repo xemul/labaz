@@ -40,7 +40,7 @@ add_executable (labaz
   src/storage.cc
   src/registry.cc
   src/http_frontend.cc
-  src/native/native_facade.cc
+  src/plywood/plywood_facade.cc
   src/potato/potato_storage.cc)
 
 target_include_directories (labaz

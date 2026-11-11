@@ -1,0 +1,591 @@
+# Copyright (C) 2026 The Labaz Authors
+# SPDX-License-Identifier: Apache-2.0
+
+"""The storage API through the plywood facade, on the potato backend."""
+
+import os
+import threading
+
+import pytest
+import requests
+
+from conftest import free_port
+from plywood_client import PlywoodClient, PlywoodError
+
+
+def expect_error(code: str, status: int, func, *args, **kwargs):
+    with pytest.raises(PlywoodError) as e:
+        func(*args, **kwargs)
+    assert (e.value.code, e.value.status) == (code, status)
+
+
+# Buckets
+
+def test_buckets(plywood):
+    plywood.create_bucket("b2")
+    assert plywood.list_buckets() == ["b2", "bkt"]
+    expect_error("bucket_exists", 409, plywood.create_bucket, "b2")
+    plywood.delete_bucket("b2")
+    assert plywood.list_buckets() == ["bkt"]
+    expect_error("no_such_bucket", 404, plywood.delete_bucket, "b2")
+
+
+def test_invalid_bucket_name(plywood):
+    expect_error("invalid_argument", 400, plywood.create_bucket, "a%7Eb")
+
+
+def test_delete_non_empty_bucket(plywood):
+    plywood.put("bkt", "k", b"x")
+    expect_error("bucket_not_empty", 409, plywood.delete_bucket, "bkt")
+    plywood.delete("bkt", "k")
+    plywood.delete_bucket("bkt")
+
+
+def test_open_session_makes_bucket_non_empty(plywood):
+    s = plywood.open_session("bkt", "a/k")
+    expect_error("bucket_not_empty", 409, plywood.delete_bucket, "bkt")
+    plywood.abort("bkt", "a/k", s)
+    plywood.delete_bucket("bkt")
+
+
+def test_deleted_objects_leave_bucket_empty(plywood):
+    plywood.put("bkt", "a/b/c", b"x")
+    plywood.put("bkt", "/x", b"x")
+    plywood.delete("bkt", "a/b/c")
+    plywood.delete("bkt", "/x")
+    plywood.delete_bucket("bkt")
+
+
+def test_no_such_bucket(plywood):
+    expect_error("no_such_bucket", 404, plywood.put, "nope", "k", b"x")
+    expect_error("no_such_bucket", 404, plywood.read, "nope", "k")
+    expect_error("no_such_bucket", 404, plywood.list, "nope")
+    expect_error("no_such_bucket", 404, plywood.open_session, "nope", "k")
+
+
+# Objects
+
+def test_put_get(plywood):
+    info = plywood.put("bkt", "key", b"hello", metadata={"Color": "red"})
+    assert info["key"] == "key"
+    assert info["size"] == 5
+    assert info["metadata"] == {"color": "red"}
+    r = plywood.get("bkt", "key")
+    assert r.content == b"hello"
+    assert r.headers["X-Labaz-Size"] == "5"
+    assert r.headers["X-Labaz-Generation"] == str(info["generation"])
+    assert r.headers["X-Labaz-Meta-color"] == "red"
+
+
+def test_head(plywood):
+    info = plywood.put("bkt", "key", b"hello", metadata={"m": "v"})
+    r = plywood.head("bkt", "key")
+    assert r.headers["X-Labaz-Size"] == "5"
+    assert r.headers["X-Labaz-Generation"] == str(info["generation"])
+    assert r.headers["X-Labaz-Meta-m"] == "v"
+    expect_error("", 404, plywood.head, "bkt", "nope")  # HEAD has no body
+
+
+def test_empty_object(plywood):
+    assert plywood.put("bkt", "empty", b"")["size"] == 0
+    assert plywood.read("bkt", "empty") == b""
+    s = plywood.open_session("bkt", "empty2")
+    assert plywood.commit("bkt", "empty2", s, [])["size"] == 0
+    assert plywood.read("bkt", "empty2") == b""
+
+
+def test_large_object(plywood):
+    data = os.urandom(5 * 1024 * 1024 + 123)
+    plywood.put("bkt", "large", data)
+    assert plywood.read("bkt", "large") == data
+
+
+def test_delete(plywood):
+    plywood.put("bkt", "key", b"x")
+    plywood.delete("bkt", "key")
+    expect_error("no_such_key", 404, plywood.read, "bkt", "key")
+    expect_error("no_such_key", 404, plywood.delete, "bkt", "key")
+
+
+def test_overwrite(plywood):
+    g1 = plywood.put("bkt", "key", b"first", metadata={"v": "1"})["generation"]
+    g2 = plywood.put("bkt", "key", b"second!", metadata={"v": "2"})["generation"]
+    assert g2 > g1
+    r = plywood.get("bkt", "key")
+    assert r.content == b"second!"
+    assert r.headers["X-Labaz-Meta-v"] == "2"
+
+
+def test_generation_precondition(plywood):
+    expect_error("precondition_failed", 412, plywood.put, "bkt", "key", b"x", generation_match=1)
+    g1 = plywood.put("bkt", "key", b"x", generation_match=0)["generation"]
+    expect_error("precondition_failed", 412, plywood.put, "bkt", "key", b"y", generation_match=0)
+    expect_error("precondition_failed", 412, plywood.put, "bkt", "key", b"y", generation_match=g1 + 1)
+    plywood.put("bkt", "key", b"y", generation_match=g1)
+    assert plywood.read("bkt", "key") == b"y"
+
+
+def test_generation_unique_after_recreate(plywood):
+    g1 = plywood.put("bkt", "key", b"x")["generation"]
+    plywood.delete("bkt", "key")
+    g2 = plywood.put("bkt", "key", b"x")["generation"]
+    assert g2 != g1
+
+
+@pytest.mark.parametrize("rng, expected, content_range", [
+    ("bytes=0-0", b"0", "bytes 0-0/10"),
+    ("bytes=2-5", b"2345", "bytes 2-5/10"),
+    ("bytes=7-", b"789", "bytes 7-9/10"),
+    ("bytes=-3", b"789", "bytes 7-9/10"),
+    ("bytes=-30", b"0123456789", "bytes 0-9/10"),
+    ("bytes=5-100", b"56789", "bytes 5-9/10"),
+])
+def test_range(plywood, rng, expected, content_range):
+    plywood.put("bkt", "key", b"0123456789")
+    r = plywood.get("bkt", "key", range=rng)
+    assert r.status_code == 206
+    assert r.content == expected
+    assert r.headers["Content-Range"] == content_range
+
+
+@pytest.mark.parametrize("rng", ["bytes=10-", "bytes=10-20", "bytes=-0"])
+def test_unsatisfiable_range(plywood, rng):
+    plywood.put("bkt", "key", b"0123456789")
+    expect_error("invalid_range", 416, plywood.read, "bkt", "key", range=rng)
+
+
+def test_bad_range(plywood):
+    plywood.put("bkt", "key", b"0123456789")
+    expect_error("bad_request", 400, plywood.read, "bkt", "key", range="pages=1-2")
+
+
+# Keys
+
+@pytest.mark.parametrize("key", [
+    "a/b/c",
+    "/leading",
+    "a//b",
+    ".", "..", "./x", "x/../y",
+    "tilde~m", "~e", "per%cent", "sp ace", "q?uery#hash",
+    "ünïcödé",
+    "x" * 1024,
+    "/".join(["y" * 300] * 3),
+])
+def test_key_round_trip(plywood, key):
+    plywood.put("bkt", key, key.encode())
+    assert plywood.read("bkt", key) == key.encode()
+    assert plywood.list_keys("bkt") == [key]
+    plywood.delete("bkt", key)
+    assert plywood.list_keys("bkt") == []
+
+
+@pytest.mark.parametrize("key", ["dir/", "a/b/"])
+def test_key_ending_with_slash(plywood, key):
+    expect_error("invalid_argument", 400, plywood.put, "bkt", key, b"x")
+    expect_error("invalid_argument", 400, plywood.open_session, "bkt", key)
+    assert plywood.list_keys("bkt") == []
+
+
+def test_file_and_directory_keys_coexist(plywood):
+    for k in ["a", "a/b", "a/b/c"]:
+        plywood.put("bkt", k, k.encode())
+    for k in ["a", "a/b", "a/b/c"]:
+        assert plywood.read("bkt", k) == k.encode()
+
+
+def test_flat_namespace(plywood):
+    plywood.put("bkt", "sstables/x/data", b"1")
+    plywood.delete("bkt", "sstables/x/data")
+    assert plywood.list_keys("bkt") == []
+    plywood.put("bkt", "sstables/x/index", b"2")
+    assert plywood.read("bkt", "sstables/x/index") == b"2"
+
+
+def test_list_order_and_prefix(plywood):
+    keys = ["a", "a/b", "a/c", "a.b", "a0", "ab", "b", "a-", "a/b/c", "~", "%", "a//x"]
+    for k in keys:
+        plywood.put("bkt", k, b"")
+    assert plywood.list_keys("bkt") == sorted(keys, key=lambda k: k.encode())
+    assert plywood.list_keys("bkt", prefix="a/") == ["a//x", "a/b", "a/b/c", "a/c"]
+    assert plywood.list_keys("bkt", prefix="a/b") == ["a/b", "a/b/c"]
+    assert plywood.list_keys("bkt", prefix="zzz") == []
+
+
+def test_list_pagination(plywood):
+    keys = sorted(f"{d}/{i:02}" for d in ["x", "y", "z"] for i in range(7))
+    for k in keys:
+        plywood.put("bkt", k, b"")
+    for page in [1, 2, 5, 100]:
+        assert plywood.list_keys("bkt", page=page) == keys
+    r = plywood.list("bkt", start_after="y/03", max_keys=2)
+    assert [o["key"] for o in r["objects"]] == ["y/04", "y/05"]
+    assert r["truncated"]
+    r = plywood.list("bkt", start_after="z/06")
+    assert r["objects"] == [] and not r["truncated"]
+
+
+def test_list_reports_object_info(plywood):
+    plywood.put("bkt", "k", b"12345", metadata={"m": "v"})
+    [o] = plywood.list("bkt")["objects"]
+    assert (o["key"], o["size"], o["metadata"]) == ("k", 5, {"m": "v"})
+
+
+# Sessions
+
+def test_session(plywood):
+    s = plywood.open_session("bkt", "obj", metadata={"m": "v"})
+    assert plywood.put_part("bkt", "obj", s, 3, b"ccc") == {"number": 3, "size": 3}
+    plywood.put_part("bkt", "obj", s, 1, b"a")
+    plywood.put_part("bkt", "obj", s, 2, b"")
+    d = plywood.describe_session("bkt", "obj", s)
+    assert (d["bucket"], d["key"], d["metadata"]) == ("bkt", "obj", {"m": "v"})
+    assert [(p["number"], p["size"]) for p in d["parts"]] == [(1, 1), (2, 0), (3, 3)]
+    info = plywood.commit("bkt", "obj", s, [1, 2, 3])
+    assert (info["size"], info["metadata"]) == (4, {"m": "v"})
+    assert plywood.read("bkt", "obj") == b"accc"
+
+
+def test_session_commit_all_parts_by_default(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 2, b"2")
+    plywood.put_part("bkt", "obj", s, 10, b"10")
+    plywood.put_part("bkt", "obj", s, 1, b"1")
+    assert plywood.commit("bkt", "obj", s)["size"] == 4
+    assert plywood.read("bkt", "obj") == b"1210"
+
+
+def test_session_part_order_is_commit_order(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"1")
+    plywood.put_part("bkt", "obj", s, 2, b"2")
+    plywood.commit("bkt", "obj", s, [2, 1])
+    assert plywood.read("bkt", "obj") == b"21"
+
+
+def test_session_resent_part_replaces(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"old")
+    plywood.put_part("bkt", "obj", s, 1, b"new!")
+    assert [p["size"] for p in plywood.describe_session("bkt", "obj", s)["parts"]] == [4]
+    plywood.commit("bkt", "obj", s, [1])
+    assert plywood.read("bkt", "obj") == b"new!"
+
+
+def test_session_commit_subset(plywood):
+    s = plywood.open_session("bkt", "obj")
+    for n in range(1, 5):
+        plywood.put_part("bkt", "obj", s, n, str(n).encode())
+    plywood.commit("bkt", "obj", s, [1, 3])
+    assert plywood.read("bkt", "obj") == b"13"
+
+
+def test_session_commit_errors(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"1")
+    expect_error("no_such_part", 404, plywood.commit, "bkt", "obj", s, [1, 2])
+    expect_error("invalid_argument", 400, plywood.commit, "bkt", "obj", s, [1, 1])
+    # The session survives a failed commit.
+    plywood.commit("bkt", "obj", s, [1])
+
+
+def test_session_commit_retry(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"1")
+    first = plywood.commit("bkt", "obj", s, [1])
+    assert plywood.commit("bkt", "obj", s, [1]) == first
+    expect_error("no_such_session", 404, plywood.put_part, "bkt", "obj", s, 2, b"2")
+    expect_error("no_such_session", 404, plywood.describe_session, "bkt", "obj", s)
+
+
+def test_session_commit_precondition(plywood):
+    g = plywood.put("bkt", "obj", b"x")["generation"]
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"y")
+    expect_error("precondition_failed", 412, plywood.commit, "bkt", "obj", s, [1], generation_match=0)
+    plywood.commit("bkt", "obj", s, [1], generation_match=g)
+    assert plywood.read("bkt", "obj") == b"y"
+
+
+def test_session_abort(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"1")
+    plywood.abort("bkt", "obj", s)
+    expect_error("no_such_session", 404, plywood.describe_session, "bkt", "obj", s)
+    expect_error("no_such_session", 404, plywood.commit, "bkt", "obj", s, [1])
+    expect_error("no_such_session", 404, plywood.abort, "bkt", "obj", s)
+    expect_error("no_such_key", 404, plywood.read, "bkt", "obj")
+
+
+def test_concurrent_sessions_of_one_object(plywood):
+    s1 = plywood.open_session("bkt", "obj")
+    s2 = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s1, 1, b"one")
+    plywood.put_part("bkt", "obj", s2, 1, b"two")
+    plywood.commit("bkt", "obj", s2)
+    assert plywood.read("bkt", "obj") == b"two"
+    plywood.commit("bkt", "obj", s1)
+    assert plywood.read("bkt", "obj") == b"one"
+
+
+def test_session_of_another_object(plywood):
+    plywood.create_bucket("other")
+    s = plywood.open_session("bkt", "obj")
+    for bucket, key in [("bkt", "obj2"), ("other", "obj")]:
+        expect_error("no_such_session", 404, plywood.put_part, bucket, key, s, 1, b"x")
+        expect_error("no_such_session", 404, plywood.describe_session, bucket, key, s)
+        expect_error("no_such_session", 404, plywood.commit, bucket, key, s)
+        expect_error("no_such_session", 404, plywood.abort, bucket, key, s)
+    plywood.abort("bkt", "obj", s)
+
+
+@pytest.mark.parametrize("session", ["nope", "0.zz", "99.1", "0.1", "../x", ""])
+def test_bad_session_ids(plywood, session):
+    expect_error("no_such_session", 404, plywood.describe_session, "bkt", "obj", session)
+
+
+def test_bad_parts_list(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"1")
+    for parts in ["1,x", "1,,2", "-1"]:
+        expect_error("bad_request", 400, plywood.request, "PATCH", "/bkt/obj", params={"session": s, "parts": parts})
+    plywood.commit("bkt", "obj", s, [1])
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+def test_part_without_session(plywood, method):
+    expect_error("bad_request", 400, plywood.request, method, "/bkt/obj", params={"part": 1}, data=b"x")
+
+
+def test_session_without_part(plywood):
+    s = plywood.open_session("bkt", "obj")
+    expect_error("bad_request", 400, plywood.request, "PUT", "/bkt/obj", params={"session": s}, data=b"x")
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+def test_unexpected_part(plywood, method):
+    s = plywood.open_session("bkt", "obj")
+    expect_error("bad_request", 400, plywood.request, method, "/bkt/obj", params={"session": s, "part": 1})
+    assert plywood.describe_session("bkt", "obj", s)["session"] == s
+
+
+def test_commit_without_session(plywood):
+    expect_error("bad_request", 400, plywood.request, "PATCH", "/bkt/obj")
+
+
+def test_session_overwrites_atomically(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"new")
+    plywood.put("bkt", "obj", b"old")
+    plywood.commit("bkt", "obj", s, [1])
+    assert plywood.read("bkt", "obj") == b"new"
+
+
+def test_range_across_parts(plywood):
+    s = plywood.open_session("bkt", "obj")
+    plywood.put_part("bkt", "obj", s, 1, b"0123")
+    plywood.put_part("bkt", "obj", s, 2, b"")
+    plywood.put_part("bkt", "obj", s, 3, b"45")
+    plywood.put_part("bkt", "obj", s, 4, b"6789")
+    plywood.commit("bkt", "obj", s, [1, 2, 3, 4])
+    data = b"0123456789"
+    for first in range(10):
+        for last in range(first, 10):
+            assert plywood.read("bkt", "obj", range=f"bytes={first}-{last}") == data[first:last + 1]
+
+
+# Copy
+
+def multipart(plywood, key, chunks):
+    s = plywood.open_session("bkt", key)
+    for n, c in enumerate(chunks, 1):
+        plywood.put_part("bkt", key, s, n, c)
+    return plywood.commit("bkt", key, s)
+
+
+def test_copy_object(plywood):
+    src = plywood.put("bkt", "src", b"payload", metadata={"m": "src"})
+    info = plywood.copy("bkt", "dst", "src", metadata={"m": "dst"})
+    assert info["size"] == 7
+    assert info["generation"] != src["generation"]
+    assert plywood.read("bkt", "dst") == b"payload"
+    assert plywood.head("bkt", "dst").headers["X-Labaz-Meta-m"] == "dst"
+    assert plywood.read("bkt", "src") == b"payload"
+
+
+def test_copy_shares_files(plywood, tmp_path):
+    plywood.put("bkt", "src", b"payload")
+    plywood.copy("bkt", "dst", "src")
+    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
+    assert links == [2, 2]
+
+
+def test_copy_outlives_source(plywood):
+    multipart(plywood, "src", [b"01", b"23", b"45"])
+    plywood.copy("bkt", "dst", "src")
+    plywood.put("bkt", "src", b"new")
+    assert plywood.read("bkt", "dst") == b"012345"
+    plywood.delete("bkt", "src")
+    assert plywood.read("bkt", "dst") == b"012345"
+
+
+def test_copy_range(plywood):
+    data = b"0123456789"
+    multipart(plywood, "src", [b"0123", b"", b"45", b"6789"])
+    for first in range(10):
+        for last in range(first, 10):
+            plywood.copy("bkt", "dst", "src", range=f"bytes={first}-{last}")
+            assert plywood.read("bkt", "dst") == data[first:last + 1]
+    plywood.copy("bkt", "dst", "src", range="bytes=7-")
+    assert plywood.read("bkt", "dst") == b"789"
+    plywood.copy("bkt", "dst", "src", range="bytes=-3")
+    assert plywood.read("bkt", "dst") == b"789"
+
+
+def test_copy_of_copy(plywood):
+    multipart(plywood, "a", [b"0123", b"4567"])
+    plywood.copy("bkt", "b", "a", range="bytes=2-5")
+    plywood.copy("bkt", "c", "b", range="bytes=1-2")
+    assert plywood.read("bkt", "c") == b"34"
+    assert plywood.read("bkt", "c", range="bytes=1-1") == b"4"
+
+
+def test_copy_onto_itself(plywood):
+    plywood.put("bkt", "obj", b"0123456789")
+    plywood.copy("bkt", "obj", "obj", range="bytes=2-4")
+    assert plywood.read("bkt", "obj") == b"234"
+
+
+def test_copy_empty_object(plywood):
+    plywood.put("bkt", "src", b"")
+    assert plywood.copy("bkt", "dst", "src")["size"] == 0
+    assert plywood.read("bkt", "dst") == b""
+    expect_error("invalid_range", 416, plywood.copy, "bkt", "dst", "src", range="bytes=0-0")
+
+
+def test_copy_parts(plywood):
+    plywood.put("bkt", "src", b"0123456789")
+    s = plywood.open_session("bkt", "dst")
+    assert plywood.copy_part("bkt", "dst", s, 1, "src", range="bytes=5-") == {"number": 1, "size": 5}
+    plywood.put_part("bkt", "dst", s, 2, b"-")
+    plywood.copy_part("bkt", "dst", s, 3, "src", range="bytes=0-4")
+    plywood.copy_part("bkt", "dst", s, 4, "src")
+    plywood.copy_part("bkt", "dst", s, 4, "src", range="bytes=0-0")  # replaces part 4
+    assert [p["size"] for p in plywood.describe_session("bkt", "dst", s)["parts"]] == [5, 1, 5, 1]
+    plywood.put("bkt", "src", b"changed")
+    plywood.commit("bkt", "dst", s, [1, 2, 3])
+    assert plywood.read("bkt", "dst") == b"56789-01234"
+
+
+def test_copy_part_dropped_on_abort(plywood, tmp_path):
+    plywood.put("bkt", "src", b"payload")
+    s = plywood.open_session("bkt", "dst")
+    plywood.copy_part("bkt", "dst", s, 1, "src")
+    plywood.abort("bkt", "dst", s)
+    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
+    assert links == [1]
+
+
+def test_copy_preconditions(plywood):
+    src = plywood.put("bkt", "src", b"payload")
+    expect_error("precondition_failed", 412, plywood.copy, "bkt", "dst", "src",
+                 src_generation_match=src["generation"] + 1)
+    expect_error("no_such_key", 404, plywood.read, "bkt", "dst")
+    plywood.copy("bkt", "dst", "src", src_generation_match=src["generation"])
+    expect_error("precondition_failed", 412, plywood.copy, "bkt", "dst", "src", generation_match=0)
+    s = plywood.open_session("bkt", "dst")
+    expect_error("precondition_failed", 412, plywood.copy_part, "bkt", "dst", s, 1, "src",
+                 src_generation_match=src["generation"] + 1)
+    assert plywood.describe_session("bkt", "dst", s)["parts"] == []
+
+
+def test_copy_missing_source(plywood):
+    expect_error("no_such_key", 404, plywood.copy, "bkt", "dst", "nope")
+    expect_error("no_such_key", 404, plywood.read, "bkt", "dst")
+    s = plywood.open_session("bkt", "dst")
+    expect_error("no_such_key", 404, plywood.copy_part, "bkt", "dst", s, 1, "nope")
+    expect_error("invalid_argument", 400, plywood.copy, "bkt", "dst", "")
+
+
+def test_copy_odd_keys(plywood):
+    src = "a&b=c/%2F?#+ ü"
+    plywood.put("bkt", src, b"x")
+    plywood.copy("bkt", "dst", src)
+    assert plywood.read("bkt", "dst") == b"x"
+
+
+@pytest.mark.parametrize("params", [
+    {"copy-range": "bytes=0-1"},
+    {"copy-if-generation-match": "1"},
+])
+def test_copy_params_without_key(plywood, params):
+    expect_error("bad_request", 400, plywood.request, "PUT", "/bkt/obj", params=params, data=b"x")
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+def test_copy_key_not_on_put(plywood, method):
+    plywood.put("bkt", "obj", b"x")
+    expect_error("bad_request", 400, plywood.request, method, "/bkt/obj", params={"copy-key": "obj"})
+    assert plywood.read("bkt", "obj") == b"x"
+
+
+# Protocol
+
+def test_unknown_route(plywood):
+    # Seastar's own "not found" reply.
+    expect_error("", 404, plywood.request, "OPTIONS", "/bkt/obj")
+
+
+def test_empty_bucket_in_path(plywood):
+    expect_error("bad_request", 400, plywood.request, "POST", "/")
+
+
+# Concurrency and sharding
+
+def test_overwrite_under_reads(plywood):
+    """A reader sees either version, never a mix or an error."""
+    a, b = b"a" * 100_000, b"b" * 50_000
+    plywood.put("bkt", "obj", a)
+    stop = threading.Event()
+    errors = []
+
+    def reader():
+        c = PlywoodClient(plywood.url)
+        while not stop.is_set():
+            try:
+                data = c.read("bkt", "obj")
+                if data not in (a, b):
+                    errors.append(f"bad content of length {len(data)}")
+            except Exception as e:
+                errors.append(repr(e))
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    try:
+        for i in range(50):
+            plywood.put("bkt", "obj", a if i % 2 else b)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()
+    assert errors == []
+
+
+# Persistence
+
+def test_objects_survive_restart(run_labaz, tmp_path):
+    data_dir = tmp_path / "data"
+    port = free_port()
+    args = ["--facade", f"plywood:http={port}", "--data-dir", str(data_dir)]
+    server = run_labaz(args)
+    c = PlywoodClient(f"http://127.0.0.1:{port}")
+    c.create_bucket("bkt")
+    info = c.put("bkt", "a/b", b"payload", metadata={"m": "v"})
+    assert server.stop() == 0
+
+    server.start()
+    c = PlywoodClient(f"http://127.0.0.1:{port}")
+    assert c.list_buckets() == ["bkt"]
+    assert c.read("bkt", "a/b") == b"payload"
+    [o] = c.list("bkt")["objects"]
+    assert o == info

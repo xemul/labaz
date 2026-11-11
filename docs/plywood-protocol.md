@@ -1,6 +1,6 @@
-# The native protocol
+# The plywood protocol
 
-`--facade native:http=<port>[,https=<port>]`
+`--facade plywood:http=<port>[,https=<port>]`
 
 A testing-only HTTP/JSON protocol that maps 1:1 to the storage API
 (`src/storage.hh`). It follows that API as it evolves and makes no attempt at
@@ -75,4 +75,4 @@ object of the same bucket instead of the body:
 is checked against the source. `copy-range` and `copy-if-generation-match`
 require `copy-key`, which is only valid on `PUT`.
 
-A test client is in `test/native_client.py`.
+A test client is in `test/plywood_client.py`.
