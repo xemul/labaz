@@ -11,6 +11,10 @@
 //   <data-dir>/<bucket>/<sha1(key)>/data.<gen>/    the object's parts
 //   <data-dir>/<bucket>/<sha1(key)>/session.<id>/  an upload session's parts
 //
+// Sealed part files are immutable. An object or a session part is a list
+// of slices (byte ranges) of them, and a copy hardlinks the source's files
+// instead of copying bytes. Every slice has a file (a link) of its own.
+//
 // A commit renames the session directory into a data directory, writes the
 // meta to a temporary file and renames it over the current one, so an
 // overwrite is atomic, and a failure before the meta rename leaves the
@@ -136,16 +140,41 @@ static future<> write_small_file(fs::path path, sstring content) {
 // Object meta
 //
 
-struct part_file {
-    sstring name;   // within the data directory
+// A byte range of a part file. Sealed part files are immutable, so a copy
+// hardlinks them and an object or a part refers to ranges of them.
+struct slice {
+    sstring file;   // within the data or session directory
+    uint64_t offset;
     uint64_t size;
 };
 
 struct object_meta {
     object_info info;
     sstring data_dir;  // within the object directory
-    std::vector<part_file> parts;
+    std::vector<slice> slices;
 };
+
+// The [offset, offset + length) range of the bytes that `slices` make up.
+static std::vector<slice> cut(const std::vector<slice>& slices, uint64_t offset, uint64_t length) {
+    std::vector<slice> ret;
+    for (auto& s : slices) {
+        if (length == 0) {
+            break;
+        }
+        if (offset >= s.size) {
+            offset -= s.size;
+            continue;
+        }
+        auto n = std::min(s.size - offset, length);
+        ret.push_back(slice{s.file, s.offset + offset, n});
+        offset = 0;
+        length -= n;
+    }
+    if (length > 0) {
+        throw std::runtime_error("object is shorter than its meta says");
+    }
+    return ret;
+}
 
 static sstring serialize(const object_meta& m) {
     rapidjson::StringBuffer sb;
@@ -163,12 +192,13 @@ static sstring serialize(const object_meta& m) {
     }
     w.EndObject();
     w.Key("data"); str(m.data_dir);
-    w.Key("parts");
+    w.Key("slices");
     w.StartArray();
-    for (auto& p : m.parts) {
+    for (auto& s : m.slices) {
         w.StartObject();
-        w.Key("name"); str(p.name);
-        w.Key("size"); w.Uint64(p.size);
+        w.Key("file"); str(s.file);
+        w.Key("offset"); w.Uint64(s.offset);
+        w.Key("size"); w.Uint64(s.size);
         w.EndObject();
     }
     w.EndArray();
@@ -193,51 +223,47 @@ static object_meta deserialize(std::string_view s) {
         m.info.metadata.emplace(str(kv.name), str(kv.value));
     }
     m.data_dir = str(d["data"]);
-    for (auto& p : d["parts"].GetArray()) {
-        m.parts.push_back(part_file{str(p["name"]), p["size"].GetUint64()});
+    for (auto& s : d["slices"].GetArray()) {
+        m.slices.push_back(slice{str(s["file"]), s["offset"].GetUint64(), s["size"].GetUint64()});
     }
     return m;
 }
 
 //
-// Reading an object across its part files
+// Reading slices of part files
 //
 
-class parts_source final : public data_source_impl {
+class slices_source final : public data_source_impl {
     std::vector<file> _files;
-    std::vector<uint64_t> _sizes;
+    std::vector<slice> _slices;
     size_t _idx = 0;
-    uint64_t _offset;      // within the current part
-    uint64_t _remaining;
+    uint64_t _left = 0;    // in the current slice
     std::optional<input_stream<char>> _cur;
 
 public:
-    parts_source(std::vector<file> files, std::vector<uint64_t> sizes, uint64_t offset, uint64_t length)
-        : _files(std::move(files)), _sizes(std::move(sizes)), _offset(offset), _remaining(length)
-    {
-        while (_idx < _sizes.size() && _offset >= _sizes[_idx]) {
-            _offset -= _sizes[_idx++];
-        }
-    }
+    // files[i] is the file of slices[i].
+    slices_source(std::vector<file> files, std::vector<slice> slices)
+        : _files(std::move(files)), _slices(std::move(slices))
+    {}
 
     future<temporary_buffer<char>> get() override {
-        while (_remaining > 0) {
+        while (_idx < _slices.size()) {
             if (!_cur) {
-                if (_idx == _sizes.size()) {
-                    throw std::runtime_error("object is shorter than its meta says");
-                }
-                auto len = std::min(_sizes[_idx] - _offset, _remaining);
-                _cur.emplace(make_file_input_stream(_files[_idx], _offset, len));
+                auto& s = _slices[_idx];
+                _cur.emplace(make_file_input_stream(_files[_idx], s.offset, s.size));
+                _left = s.size;
             }
             auto buf = co_await _cur->read();
             if (buf.empty()) {
+                if (_left > 0) {
+                    throw std::runtime_error("part file is shorter than its slice");
+                }
                 co_await _cur->close();
                 _cur.reset();
                 _idx++;
-                _offset = 0;
                 continue;
             }
-            _remaining -= std::min<uint64_t>(_remaining, buf.size());
+            _left -= std::min<uint64_t>(_left, buf.size());
             co_return buf;
         }
         co_return temporary_buffer<char>();
@@ -260,7 +286,7 @@ public:
 //
 
 struct sealed_part {
-    sstring name;
+    std::vector<slice> slices;
     uint64_t size;
 };
 
@@ -373,7 +399,43 @@ public:
         }
         co_await rename_file(tmp.native(), final.native());
         auto size = co_await file_size(final.native());
-        co_return co_await add_part(bucket, key, id, number, sealed_part{final.filename().native(), size});
+        co_return co_await add_part(bucket, key, id, number, sealed_part{{slice{final.filename().native(), 0, size}}, size});
+    }
+
+    future<part_info> copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                sstring src_key, std::optional<byte_range> range, precondition src_pre) override {
+        active_session(bucket, key, id);
+        auto dir = session_dir(bucket, key, id);
+        sealed_part part{{}, 0};
+        {
+            // The source's files are linked before an overwrite or delete
+            // can remove them; the links then live on their own.
+            auto lock = co_await _lock.hold_read_lock();
+            auto m = co_await load_meta(bucket, src_key);
+            if (src_pre.generation_match && *src_pre.generation_match != m.info.generation) {
+                fail(errc::precondition_failed, fmt::format("source generation is {}, not {}",
+                                                            m.info.generation, *src_pre.generation_match));
+            }
+            auto [offset, length] = range ? resolve_range(*range, m.info.size) : resolved_range{0, m.info.size};
+            auto src_dir = object_dir(bucket, src_key) / m.data_dir.c_str();
+            std::exception_ptr ex;
+            try {
+                for (auto& s : cut(m.slices, offset, length)) {
+                    auto name = sstring(fmt::format("{}{}.{:x}", part_prefix, number, next_unique()));
+                    co_await link_file((src_dir / s.file.c_str()).native(), (dir / name.c_str()).native());
+                    part.slices.push_back(slice{std::move(name), s.offset, s.size});
+                    part.size += s.size;
+                }
+            } catch (...) {
+                ex = std::current_exception();
+            }
+            if (ex) {
+                auto removed = co_await coroutine::as_future(remove_files(dir, part.slices));
+                removed.ignore_ready_future();
+                std::rethrow_exception(ex);
+            }
+        }
+        co_return co_await add_part(bucket, key, id, number, std::move(part));
     }
 
     future<session_info> describe_session(sstring bucket, sstring key, session_id id) override {
@@ -403,7 +465,7 @@ public:
             if (!listed.insert(n).second) {
                 fail(errc::invalid_argument, fmt::format("part {} listed twice", n));
             }
-            m.parts.push_back(part_file{p->second.name, p->second.size});
+            m.slices.insert(m.slices.end(), p->second.slices.begin(), p->second.slices.end());
             m.info.size += p->second.size;
         }
 
@@ -439,15 +501,14 @@ public:
         auto lock = co_await _lock.hold_read_lock();
         auto m = co_await load_meta(bucket, key);
         auto [offset, length] = range ? resolve_range(*range, m.info.size) : resolved_range{0, m.info.size};
+        auto slices = cut(m.slices, offset, length);
 
         std::vector<file> files;
-        std::vector<uint64_t> sizes;
         auto dir = object_dir(bucket, key) / m.data_dir.c_str();
         std::exception_ptr ex;
         try {
-            for (auto& p : m.parts) {
-                files.push_back(co_await open_file_dma((dir / p.name.c_str()).native(), open_flags::ro));
-                sizes.push_back(p.size);
+            for (auto& s : slices) {
+                files.push_back(co_await open_file_dma((dir / s.file.c_str()).native(), open_flags::ro));
             }
         } catch (...) {
             ex = std::current_exception();
@@ -457,7 +518,7 @@ public:
             std::rethrow_exception(ex);
         }
 
-        auto src = std::make_unique<parts_source>(std::move(files), std::move(sizes), offset, length);
+        auto src = std::make_unique<slices_source>(std::move(files), std::move(slices));
         co_return object_reader{std::move(m.info), input_stream<char>(data_source(std::move(src)))};
     }
 
@@ -559,6 +620,13 @@ private:
         return it->second;
     }
 
+    // Every slice has a file of its own.
+    static future<> remove_files(fs::path dir, const std::vector<slice>& slices) {
+        for (auto& s : slices) {
+            co_await remove_file((dir / s.file.c_str()).native());
+        }
+    }
+
     static future<> close_all(std::vector<file>& files) {
         for (auto& f : files) {
             co_await f.close();
@@ -623,7 +691,7 @@ private:
         co_await rename_file(session_dir(st.bucket, st.key, id).native(), data_dir.native());
         for (auto& [n, p] : st.parts) {
             if (!listed.contains(n)) {
-                co_await remove_file((data_dir / p.name.c_str()).native());
+                co_await remove_files(data_dir, p.slices);
             }
         }
 
@@ -649,20 +717,18 @@ private:
         if (it == _sessions.end() || it->second.bucket != bucket || it->second.key != key
                 || it->second.committed || it->second.committing) {
             if (it != _sessions.end() && !it->second.committed) {
-                co_await remove_file((session_dir(bucket, key, id) / part.name.c_str()).native());
+                co_await remove_files(session_dir(bucket, key, id), part.slices);
             }
             fail(errc::no_such_session, fmt::format("no such session '{}' for {}/{}", id, bucket, key));
         }
         auto& st = it->second;
         part_info ret{number, part.size};
-        std::optional<sstring> replaced;
+        std::vector<slice> replaced;
         if (auto old = st.parts.find(number); old != st.parts.end()) {
-            replaced = old->second.name;
+            replaced = std::move(old->second.slices);
         }
         st.parts.insert_or_assign(number, std::move(part));
-        if (replaced) {
-            co_await remove_file((session_dir(bucket, key, id) / replaced->c_str()).native());
-        }
+        co_await remove_files(session_dir(bucket, key, id), replaced);
         co_return ret;
     }
 };

@@ -16,7 +16,7 @@ understand and debug, so it trades everything else for that.
 Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
 
 ```
-<bucket>/<sha1(key)>/meta.json        object meta (JSON): the key, attributes and part files
+<bucket>/<sha1(key)>/meta.json        object meta (JSON): the key, attributes and slices
 <bucket>/<sha1(key)>/data.<gen>/      the object's parts
 <bucket>/<sha1(key)>/session.<id>/    an upload session's parts
 ```
@@ -34,6 +34,11 @@ Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
   cannot remove them under it; once open, the files stay readable.
 - An object directory is removed once it holds neither an object nor a
   session.
+- Sealed part files are never modified. An object, and a session part, is a
+  list of slices: byte ranges of part files. A copy hardlinks the source's
+  part files into the session (one link per slice) under the read lock, and
+  records the slices that the copied range covers, so no data is copied and
+  the copy does not depend on the source afterwards.
 - Every call is served on the shard it is made on; there is no routing
   between shards. Sessions live in the memory of the shard that opened them,
   so all calls of a session must come to that shard. Until the facades route

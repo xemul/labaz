@@ -173,11 +173,8 @@ static precondition precondition_from_headers(const request& req) {
     return pre;
 }
 
-static std::optional<byte_range> range_from_headers(const request& req) {
-    auto v = req.get_header("Range");
-    if (v.empty()) {
-        return std::nullopt;
-    }
+// Parses an HTTP-style "bytes=first-last" range.
+static byte_range parse_range(std::string_view v) {
     std::string_view s = v;
     if (!s.starts_with("bytes=") || s.find(',') != std::string_view::npos) {
         throw bad_request(fmt::format("unsupported range '{}'", s));
@@ -197,6 +194,31 @@ static std::optional<byte_range> range_from_headers(const request& req) {
     return r;
 }
 
+static std::optional<byte_range> range_from_headers(const request& req) {
+    auto v = req.get_header("Range");
+    if (v.empty()) {
+        return std::nullopt;
+    }
+    return parse_range(v);
+}
+
+// The copy source's range, from ?copy-range=.
+static std::optional<byte_range> copy_range(const request& req) {
+    if (!req.has_query_param("copy-range")) {
+        return std::nullopt;
+    }
+    return parse_range(req.get_query_param("copy-range"));
+}
+
+// The copy source's precondition, from ?copy-if-generation-match=.
+static precondition copy_precondition(const request& req) {
+    precondition pre;
+    if (req.has_query_param("copy-if-generation-match")) {
+        pre.generation_match = parse_number<uint64_t>(req.get_query_param("copy-if-generation-match"), "generation");
+    }
+    return pre;
+}
+
 // Whether the request addresses a session (?session=) rather than the object.
 // A session request takes ?part= if and only if `takes_part`; an object
 // request never does.
@@ -210,6 +232,19 @@ static bool is_session_request(const request& req, bool takes_part) {
         throw bad_request(takes_part ? "'session' requires 'part'" : "unexpected 'part'");
     }
     return session;
+}
+
+// Whether the request copies from another object of the bucket (?copy-key=)
+// rather than carrying the data. Only allowed if `allowed`.
+static bool is_copy_request(const request& req, bool allowed) {
+    bool copy = req.has_query_param("copy-key");
+    if (!copy && (req.has_query_param("copy-range") || req.has_query_param("copy-if-generation-match"))) {
+        throw bad_request("'copy-range' and 'copy-if-generation-match' require 'copy-key'");
+    }
+    if (copy && !allowed) {
+        throw bad_request("unexpected 'copy-key'");
+    }
+    return copy;
 }
 
 static void add_object_headers(reply& rep, const object_info& info) {
@@ -355,6 +390,7 @@ private:
     // Objects, or their sessions with ?session=
 
     future<std::unique_ptr<reply>> get_object_or_session(request& req, std::unique_ptr<reply> rep) {
+        is_copy_request(req, false);
         if (is_session_request(req, false)) {
             return get_session(req, std::move(rep));
         }
@@ -362,13 +398,15 @@ private:
     }
 
     future<std::unique_ptr<reply>> put_object_or_session(request& req, std::unique_ptr<reply> rep) {
+        bool copy = is_copy_request(req, true);
         if (is_session_request(req, true)) {
-            return put_session(req, std::move(rep));
+            return copy ? copy_session(req, std::move(rep)) : put_session(req, std::move(rep));
         }
-        return put_object(req, std::move(rep));
+        return copy ? copy_object(req, std::move(rep)) : put_object(req, std::move(rep));
     }
 
     future<std::unique_ptr<reply>> delete_object_or_session(request& req, std::unique_ptr<reply> rep) {
+        is_copy_request(req, false);
         if (is_session_request(req, false)) {
             return delete_session(req, std::move(rep));
         }
@@ -401,6 +439,22 @@ private:
     }
 
     future<std::unique_ptr<reply>> put_object(request& req, std::unique_ptr<reply> rep) {
+        return single_part_upload(req, std::move(rep), [this, &req] (sstring bucket, sstring key, session_id id) {
+            return _storage.write_part(std::move(bucket), std::move(key), std::move(id), 1, *req.content_stream);
+        });
+    }
+
+    // Copies another object of the bucket, or a range of it, as the object.
+    future<std::unique_ptr<reply>> copy_object(request& req, std::unique_ptr<reply> rep) {
+        return single_part_upload(req, std::move(rep), [this, &req] (sstring bucket, sstring key, session_id id) {
+            return _storage.copy_part(std::move(bucket), std::move(key), std::move(id), 1,
+                                      req.get_query_param("copy-key"), copy_range(req), copy_precondition(req));
+        });
+    }
+
+    // Makes the object of a session whose only part `make_part` makes.
+    template <typename Func>
+    future<std::unique_ptr<reply>> single_part_upload(request& req, std::unique_ptr<reply> rep, Func make_part) {
         auto bucket = bucket_param(req);
         auto key = key_param(req);
         auto pre = precondition_from_headers(req);
@@ -408,7 +462,7 @@ private:
         object_info info;
         std::exception_ptr ex;
         try {
-            co_await _storage.write_part(bucket, key, id, 1, *req.content_stream);
+            co_await make_part(bucket, key, id);
             info = co_await _storage.commit_session(bucket, key, id, {1}, pre);
         } catch (...) {
             ex = std::current_exception();
@@ -468,6 +522,14 @@ private:
     future<std::unique_ptr<reply>> delete_session(request& req, std::unique_ptr<reply> rep) {
         co_await _storage.abort_session(bucket_param(req), key_param(req), req.get_query_param("session"));
         co_return empty_reply(std::move(rep));
+    }
+
+    // Copies another object of the bucket, or a range of it, as a part.
+    future<std::unique_ptr<reply>> copy_session(request& req, std::unique_ptr<reply> rep) {
+        auto number = parse_number<unsigned>(req.get_query_param("part"), "part number");
+        auto p = co_await _storage.copy_part(bucket_param(req), key_param(req), req.get_query_param("session"), number,
+                                             req.get_query_param("copy-key"), copy_range(req), copy_precondition(req));
+        co_return json_reply(std::move(rep), [&] (json_writer& w) { write_part_info(w, p); });
     }
 
     future<std::unique_ptr<reply>> commit_session(request& req, std::unique_ptr<reply> rep) {

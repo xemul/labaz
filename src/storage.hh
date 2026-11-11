@@ -149,6 +149,11 @@ public:
     /// The stream stays the caller's: it is not closed.
     virtual future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number,
                                          seastar::input_stream<char>& in) = 0;
+    /// Makes the bytes of the bucket's object `src_key` (all of them, or the
+    /// range) part `number` of the session, replacing an earlier part with
+    /// the same number. `src_pre` is checked against the source object.
+    virtual future<part_info> copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                        sstring src_key, std::optional<byte_range> range, precondition src_pre) = 0;
     virtual future<session_info> describe_session(sstring bucket, sstring key, session_id id) = 0;
     /// Publishes the listed parts, in the given order, as the session's
     /// object, replacing the current version atomically. Parts not listed

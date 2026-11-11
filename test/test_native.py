@@ -393,6 +393,141 @@ def test_range_across_parts(native):
             assert native.read("bkt", "obj", range=f"bytes={first}-{last}") == data[first:last + 1]
 
 
+# Copy
+
+def multipart(native, key, chunks):
+    s = native.open_session("bkt", key)
+    for n, c in enumerate(chunks, 1):
+        native.put_part("bkt", key, s, n, c)
+    return native.commit("bkt", key, s)
+
+
+def test_copy_object(native):
+    src = native.put("bkt", "src", b"payload", metadata={"m": "src"})
+    info = native.copy("bkt", "dst", "src", metadata={"m": "dst"})
+    assert info["size"] == 7
+    assert info["generation"] != src["generation"]
+    assert native.read("bkt", "dst") == b"payload"
+    assert native.head("bkt", "dst").headers["X-Labaz-Meta-m"] == "dst"
+    assert native.read("bkt", "src") == b"payload"
+
+
+def test_copy_shares_files(native, tmp_path):
+    native.put("bkt", "src", b"payload")
+    native.copy("bkt", "dst", "src")
+    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
+    assert links == [2, 2]
+
+
+def test_copy_outlives_source(native):
+    multipart(native, "src", [b"01", b"23", b"45"])
+    native.copy("bkt", "dst", "src")
+    native.put("bkt", "src", b"new")
+    assert native.read("bkt", "dst") == b"012345"
+    native.delete("bkt", "src")
+    assert native.read("bkt", "dst") == b"012345"
+
+
+def test_copy_range(native):
+    data = b"0123456789"
+    multipart(native, "src", [b"0123", b"", b"45", b"6789"])
+    for first in range(10):
+        for last in range(first, 10):
+            native.copy("bkt", "dst", "src", range=f"bytes={first}-{last}")
+            assert native.read("bkt", "dst") == data[first:last + 1]
+    native.copy("bkt", "dst", "src", range="bytes=7-")
+    assert native.read("bkt", "dst") == b"789"
+    native.copy("bkt", "dst", "src", range="bytes=-3")
+    assert native.read("bkt", "dst") == b"789"
+
+
+def test_copy_of_copy(native):
+    multipart(native, "a", [b"0123", b"4567"])
+    native.copy("bkt", "b", "a", range="bytes=2-5")
+    native.copy("bkt", "c", "b", range="bytes=1-2")
+    assert native.read("bkt", "c") == b"34"
+    assert native.read("bkt", "c", range="bytes=1-1") == b"4"
+
+
+def test_copy_onto_itself(native):
+    native.put("bkt", "obj", b"0123456789")
+    native.copy("bkt", "obj", "obj", range="bytes=2-4")
+    assert native.read("bkt", "obj") == b"234"
+
+
+def test_copy_empty_object(native):
+    native.put("bkt", "src", b"")
+    assert native.copy("bkt", "dst", "src")["size"] == 0
+    assert native.read("bkt", "dst") == b""
+    expect_error("invalid_range", 416, native.copy, "bkt", "dst", "src", range="bytes=0-0")
+
+
+def test_copy_parts(native):
+    native.put("bkt", "src", b"0123456789")
+    s = native.open_session("bkt", "dst")
+    assert native.copy_part("bkt", "dst", s, 1, "src", range="bytes=5-") == {"number": 1, "size": 5}
+    native.put_part("bkt", "dst", s, 2, b"-")
+    native.copy_part("bkt", "dst", s, 3, "src", range="bytes=0-4")
+    native.copy_part("bkt", "dst", s, 4, "src")
+    native.copy_part("bkt", "dst", s, 4, "src", range="bytes=0-0")  # replaces part 4
+    assert [p["size"] for p in native.describe_session("bkt", "dst", s)["parts"]] == [5, 1, 5, 1]
+    native.put("bkt", "src", b"changed")
+    native.commit("bkt", "dst", s, [1, 2, 3])
+    assert native.read("bkt", "dst") == b"56789-01234"
+
+
+def test_copy_part_dropped_on_abort(native, tmp_path):
+    native.put("bkt", "src", b"payload")
+    s = native.open_session("bkt", "dst")
+    native.copy_part("bkt", "dst", s, 1, "src")
+    native.abort("bkt", "dst", s)
+    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
+    assert links == [1]
+
+
+def test_copy_preconditions(native):
+    src = native.put("bkt", "src", b"payload")
+    expect_error("precondition_failed", 412, native.copy, "bkt", "dst", "src",
+                 src_generation_match=src["generation"] + 1)
+    expect_error("no_such_key", 404, native.read, "bkt", "dst")
+    native.copy("bkt", "dst", "src", src_generation_match=src["generation"])
+    expect_error("precondition_failed", 412, native.copy, "bkt", "dst", "src", generation_match=0)
+    s = native.open_session("bkt", "dst")
+    expect_error("precondition_failed", 412, native.copy_part, "bkt", "dst", s, 1, "src",
+                 src_generation_match=src["generation"] + 1)
+    assert native.describe_session("bkt", "dst", s)["parts"] == []
+
+
+def test_copy_missing_source(native):
+    expect_error("no_such_key", 404, native.copy, "bkt", "dst", "nope")
+    expect_error("no_such_key", 404, native.read, "bkt", "dst")
+    s = native.open_session("bkt", "dst")
+    expect_error("no_such_key", 404, native.copy_part, "bkt", "dst", s, 1, "nope")
+    expect_error("invalid_argument", 400, native.copy, "bkt", "dst", "")
+
+
+def test_copy_odd_keys(native):
+    src = "a&b=c/%2F?#+ ü"
+    native.put("bkt", src, b"x")
+    native.copy("bkt", "dst", src)
+    assert native.read("bkt", "dst") == b"x"
+
+
+@pytest.mark.parametrize("params", [
+    {"copy-range": "bytes=0-1"},
+    {"copy-if-generation-match": "1"},
+])
+def test_copy_params_without_key(native, params):
+    expect_error("bad_request", 400, native.request, "PUT", "/bkt/obj", params=params, data=b"x")
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+def test_copy_key_not_on_put(native, method):
+    native.put("bkt", "obj", b"x")
+    expect_error("bad_request", 400, native.request, method, "/bkt/obj", params={"copy-key": "obj"})
+    assert native.read("bkt", "obj") == b"x"
+
+
 # Protocol
 
 def test_unknown_route(native):

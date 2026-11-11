@@ -71,6 +71,24 @@ class NativeClient:
     def read(self, bucket: str, key: str, range: str | None = None) -> bytes:
         return self.get(bucket, key, range).content
 
+    @staticmethod
+    def _copy_params(src_key: str, range: str | None, src_generation_match: int | None) -> dict:
+        params = {"copy-key": src_key}
+        if range is not None:
+            params["copy-range"] = range
+        if src_generation_match is not None:
+            params["copy-if-generation-match"] = src_generation_match
+        return params
+
+    def copy(self, bucket: str, key: str, src_key: str, range: str | None = None,
+             src_generation_match: int | None = None, metadata: dict | None = None,
+             generation_match: int | None = None) -> dict:
+        headers = self._meta_headers(metadata)
+        if generation_match is not None:
+            headers["X-Labaz-If-Generation-Match"] = str(generation_match)
+        return self.request("PUT", self._obj(bucket, key), headers=headers,
+                            params=self._copy_params(src_key, range, src_generation_match)).json()
+
     def head(self, bucket: str, key: str) -> requests.Response:
         return self.request("HEAD", self._obj(bucket, key))
 
@@ -102,6 +120,11 @@ class NativeClient:
     def put_part(self, bucket: str, key: str, session: str, number: int, data: bytes) -> dict:
         return self.request("PUT", self._obj(bucket, key), params={"session": session, "part": number},
                             data=data).json()
+
+    def copy_part(self, bucket: str, key: str, session: str, number: int, src_key: str,
+                  range: str | None = None, src_generation_match: int | None = None) -> dict:
+        params = {"session": session, "part": number, **self._copy_params(src_key, range, src_generation_match)}
+        return self.request("PUT", self._obj(bucket, key), params=params).json()
 
     def describe_session(self, bucket: str, key: str, session: str) -> dict:
         return self.request("GET", self._obj(bucket, key), params={"session": session}).json()

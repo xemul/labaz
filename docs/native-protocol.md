@@ -61,4 +61,18 @@ A session belongs to one object; using its id with another object's path is
 `part` is only valid together with `session`, on `PUT`; anywhere else, and a
 `PUT ?session` without it, is `bad_request`.
 
+## Copy
+
+A `PUT` of an object or of a session part can take its data from another
+object of the same bucket instead of the body:
+
+| Request | Reply |
+|---|---|
+| `PUT /{bucket}/{key}?copy-key={src}[&copy-range=bytes=a-b][&copy-if-generation-match={g}]` | object info. The source's data (or the range of it) becomes the object. Metadata and the destination's `X-Labaz-If-Generation-Match` come from the headers, as for a plain `PUT` |
+| `PUT /{bucket}/{key}?session={id}&part={n}&copy-key={src}[&copy-range=...][&copy-if-generation-match={g}]` | `{"number", "size"}`. The source's data (or the range of it) becomes the part |
+
+`copy-range` has the syntax of the `Range` header. `copy-if-generation-match`
+is checked against the source. `copy-range` and `copy-if-generation-match`
+require `copy-key`, which is only valid on `PUT`.
+
 A test client is in `test/native_client.py`.
