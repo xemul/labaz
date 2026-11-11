@@ -48,6 +48,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/file.hh>
+#include <seastar/util/short_streams.hh>
 #include <seastar/util/log.hh>
 
 namespace labaz::potato {
@@ -187,10 +188,31 @@ static sstring serialize(const object_meta& m) {
     w.Key("generation"); w.Uint64(m.info.generation);
     w.Key("metadata");
     w.StartObject();
-    for (auto& [k, v] : m.info.metadata) {
+    for (auto& [k, v] : m.info.attrs.metadata) {
         str(k); str(v);
     }
     w.EndObject();
+    w.Key("checksums");
+    w.StartArray();
+    for (auto alg : m.info.attrs.checksums) {
+        str(to_string(alg));
+    }
+    w.EndArray();
+    w.Key("parts");
+    w.StartArray();
+    for (auto& p : m.info.parts) {
+        w.StartObject();
+        w.Key("number"); w.Uint(p.number);
+        w.Key("size"); w.Uint64(p.size);
+        w.Key("checksums");
+        w.StartObject();
+        for (auto& [alg, value] : p.checksums) {
+            str(to_string(alg)); str(to_hex(value));
+        }
+        w.EndObject();
+        w.EndObject();
+    }
+    w.EndArray();
     w.Key("data"); str(m.data_dir);
     w.Key("slices");
     w.StartArray();
@@ -219,8 +241,29 @@ static object_meta deserialize(std::string_view s) {
     m.info.mtime = clock_type::time_point(std::chrono::duration_cast<clock_type::duration>(
             std::chrono::nanoseconds(d["mtime_ns"].GetInt64())));
     m.info.generation = d["generation"].GetUint64();
+    auto algorithm = [] (std::string_view name) {
+        auto alg = checksum_algorithm_from_string(name);
+        if (!alg) {
+            throw std::runtime_error(fmt::format("unknown checksum algorithm '{}' in object meta", name));
+        }
+        return *alg;
+    };
     for (auto& kv : d["metadata"].GetObject()) {
-        m.info.metadata.emplace(str(kv.name), str(kv.value));
+        m.info.attrs.metadata.emplace(str(kv.name), str(kv.value));
+    }
+    for (auto& a : d["checksums"].GetArray()) {
+        m.info.attrs.checksums.insert(algorithm(str(a)));
+    }
+    for (auto& p : d["parts"].GetArray()) {
+        part_info part{p["number"].GetUint(), p["size"].GetUint64(), {}};
+        for (auto& kv : p["checksums"].GetObject()) {
+            auto value = from_hex(str(kv.value));
+            if (!value) {
+                throw std::runtime_error("corrupt checksum in object meta");
+            }
+            part.checksums.emplace(algorithm(str(kv.name)), std::move(*value));
+        }
+        m.info.parts.push_back(std::move(part));
     }
     m.data_dir = str(d["data"]);
     for (auto& s : d["slices"].GetArray()) {
@@ -288,6 +331,7 @@ public:
 struct sealed_part {
     std::vector<slice> slices;
     uint64_t size;
+    checksums sums;
 };
 
 struct session_state {
@@ -373,14 +417,20 @@ public:
     }
 
     future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number, input_stream<char>& in) override {
-        active_session(bucket, key, id);
+        auto algorithms = active_session(bucket, key, id).attrs.checksums;
         auto final = session_dir(bucket, key, id) / fmt::format("{}{}.{:x}", part_prefix, number, next_unique());
         auto tmp = fs::path(final.native() + ".tmp");
         auto f = co_await open_file_dma(tmp.native(), open_flags::wo | open_flags::create | open_flags::exclusive);
         auto out = co_await make_file_output_stream(std::move(f));
+        checksums sums;
         std::exception_ptr ex;
         try {
-            co_await copy(in, out);
+            if (algorithms.empty()) {
+                co_await copy(in, out);
+            } else {
+                auto summed = make_checksumming_stream(in, std::move(algorithms), [&sums] (checksums c) { sums = std::move(c); });
+                co_await copy(summed, out);
+            }
         } catch (...) {
             ex = std::current_exception();
         }
@@ -399,14 +449,15 @@ public:
         }
         co_await rename_file(tmp.native(), final.native());
         auto size = co_await file_size(final.native());
-        co_return co_await add_part(bucket, key, id, number, sealed_part{{slice{final.filename().native(), 0, size}}, size});
+        co_return co_await add_part(bucket, key, id, number,
+                                    sealed_part{{slice{final.filename().native(), 0, size}}, size, std::move(sums)});
     }
 
     future<part_info> copy_part(sstring bucket, sstring key, session_id id, unsigned number,
                                 sstring src_key, std::optional<byte_range> range, precondition src_pre) override {
-        active_session(bucket, key, id);
+        auto algorithms = active_session(bucket, key, id).attrs.checksums;
         auto dir = session_dir(bucket, key, id);
-        sealed_part part{{}, 0};
+        sealed_part part{{}, 0, {}};
         {
             // The source's files are linked before an overwrite or delete
             // can remove them; the links then live on their own.
@@ -417,6 +468,11 @@ public:
                                                             m.info.generation, *src_pre.generation_match));
             }
             auto [offset, length] = range ? resolve_range(*range, m.info.size) : resolved_range{0, m.info.size};
+            // What can be derived from the source's parts' checksums; the
+            // rest is computed from the data below.
+            if (offset == 0 && length == m.info.size) {
+                part.sums = concatenated_checksums(m.info.parts, algorithms);
+            }
             auto src_dir = object_dir(bucket, src_key) / m.data_dir.c_str();
             std::exception_ptr ex;
             try {
@@ -435,6 +491,21 @@ public:
                 std::rethrow_exception(ex);
             }
         }
+        std::set<checksum_algorithm> missing;
+        std::ranges::copy_if(algorithms, std::inserter(missing, missing.end()),
+                             [&part] (checksum_algorithm alg) { return !part.sums.contains(alg); });
+        if (!missing.empty()) {
+            // The links are the session's now, so they are read without
+            // the lock.
+            auto f = co_await coroutine::as_future(checksum_slices(dir, part.slices, std::move(missing)));
+            if (f.failed()) {
+                auto ex = f.get_exception();
+                auto removed = co_await coroutine::as_future(remove_files(dir, part.slices));
+                removed.ignore_ready_future();
+                std::rethrow_exception(ex);
+            }
+            part.sums.merge(f.get());
+        }
         co_return co_await add_part(bucket, key, id, number, std::move(part));
     }
 
@@ -442,7 +513,7 @@ public:
         auto& st = active_session(bucket, key, id);
         session_info ret{id, st.bucket, st.key, st.attrs, {}};
         for (auto& [n, p] : st.parts) {
-            ret.parts.push_back(part_info{n, p.size});
+            ret.parts.push_back(part_info{n, p.size, p.sums});
         }
         co_return ret;
     }
@@ -467,6 +538,7 @@ public:
             }
             m.slices.insert(m.slices.end(), p->second.slices.begin(), p->second.slices.end());
             m.info.size += p->second.size;
+            m.info.parts.push_back(part_info{n, p->second.size, p->second.sums});
         }
 
         st.committing = true;
@@ -501,25 +573,8 @@ public:
         auto lock = co_await _lock.hold_read_lock();
         auto m = co_await load_meta(bucket, key);
         auto [offset, length] = range ? resolve_range(*range, m.info.size) : resolved_range{0, m.info.size};
-        auto slices = cut(m.slices, offset, length);
-
-        std::vector<file> files;
-        auto dir = object_dir(bucket, key) / m.data_dir.c_str();
-        std::exception_ptr ex;
-        try {
-            for (auto& s : slices) {
-                files.push_back(co_await open_file_dma((dir / s.file.c_str()).native(), open_flags::ro));
-            }
-        } catch (...) {
-            ex = std::current_exception();
-        }
-        if (ex) {
-            co_await close_all(files);
-            std::rethrow_exception(ex);
-        }
-
-        auto src = std::make_unique<slices_source>(std::move(files), std::move(slices));
-        co_return object_reader{std::move(m.info), input_stream<char>(data_source(std::move(src)))};
+        auto src = co_await open_slices(object_dir(bucket, key) / m.data_dir.c_str(), cut(m.slices, offset, length));
+        co_return object_reader{std::move(m.info), input_stream<char>(std::move(src))};
     }
 
     future<> delete_object(sstring bucket, sstring key) override {
@@ -634,6 +689,37 @@ private:
         files.clear();
     }
 
+    // A source of the slices' data; their files are open once it is returned.
+    static future<data_source> open_slices(fs::path dir, std::vector<slice> slices) {
+        std::vector<file> files;
+        std::exception_ptr ex;
+        try {
+            for (auto& s : slices) {
+                files.push_back(co_await open_file_dma((dir / s.file.c_str()).native(), open_flags::ro));
+            }
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        if (ex) {
+            co_await close_all(files);
+            std::rethrow_exception(ex);
+        }
+        co_return data_source(std::make_unique<slices_source>(std::move(files), std::move(slices)));
+    }
+
+    // Reads the slices' data to compute its checksums.
+    static future<checksums> checksum_slices(fs::path dir, std::vector<slice> slices, std::set<checksum_algorithm> algorithms) {
+        auto in = input_stream<char>(co_await open_slices(std::move(dir), std::move(slices)));
+        checksums ret;
+        auto summed = make_checksumming_stream(in, std::move(algorithms), [&ret] (checksums c) { ret = std::move(c); });
+        auto f = co_await coroutine::as_future(util::skip_entire_stream(summed));
+        co_await in.close();
+        if (f.failed()) {
+            std::rethrow_exception(f.get_exception());
+        }
+        co_return ret;
+    }
+
     future<std::optional<object_meta>> try_load_meta(std::string_view bucket, std::string_view key) {
         auto f = co_await coroutine::as_future(util::read_entire_file_contiguous(object_dir(bucket, key) / meta_name));
         if (f.failed()) {
@@ -697,7 +783,7 @@ private:
 
         m.info.key = st.key;
         m.info.mtime = clock_type::now();
-        m.info.metadata = st.attrs.metadata;
+        m.info.attrs = st.attrs;
 
         auto path = dir / meta_name;
         auto tmp = fs::path(fmt::format("{}.{:x}.tmp", path.native(), m.info.generation));
@@ -722,7 +808,7 @@ private:
             fail(errc::no_such_session, fmt::format("no such session '{}' for {}/{}", id, bucket, key));
         }
         auto& st = it->second;
-        part_info ret{number, part.size};
+        part_info ret{number, part.size, part.sums};
         std::vector<slice> replaced;
         if (auto old = st.parts.find(number); old != st.parts.end()) {
             replaced = std::move(old->second.slices);

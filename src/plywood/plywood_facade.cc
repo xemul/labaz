@@ -29,6 +29,7 @@ using status = http::reply::status_type;
 namespace bpo = boost::program_options;
 
 static constexpr std::string_view meta_header_prefix = "x-labaz-meta-";
+static constexpr std::string_view checksum_header_prefix = "x-labaz-checksum-";
 static constexpr unsigned default_max_keys = 1000;
 
 class bad_request : public std::runtime_error {
@@ -85,13 +86,12 @@ static void write_metadata(json_writer& w, const user_metadata& md) {
     w.EndObject();
 }
 
-static void write_object_info(json_writer& w, const object_info& info) {
+static void write_checksums(json_writer& w, const checksums& sums) {
     w.StartObject();
-    w.Key("key"); write_string(w, info.key);
-    w.Key("size"); w.Uint64(info.size);
-    w.Key("generation"); w.Uint64(info.generation);
-    w.Key("mtime_ns"); w.Int64(std::chrono::duration_cast<std::chrono::nanoseconds>(info.mtime.time_since_epoch()).count());
-    w.Key("metadata"); write_metadata(w, info.metadata);
+    for (auto& [alg, value] : sums) {
+        write_string(w, to_string(alg));
+        write_string(w, to_hex(value));
+    }
     w.EndObject();
 }
 
@@ -99,6 +99,24 @@ static void write_part_info(json_writer& w, const part_info& p) {
     w.StartObject();
     w.Key("number"); w.Uint(p.number);
     w.Key("size"); w.Uint64(p.size);
+    w.Key("checksums"); write_checksums(w, p.checksums);
+    w.EndObject();
+}
+
+static void write_object_info(json_writer& w, const object_info& info) {
+    w.StartObject();
+    w.Key("key"); write_string(w, info.key);
+    w.Key("size"); w.Uint64(info.size);
+    w.Key("generation"); w.Uint64(info.generation);
+    w.Key("mtime_ns"); w.Int64(std::chrono::duration_cast<std::chrono::nanoseconds>(info.mtime.time_since_epoch()).count());
+    w.Key("metadata"); write_metadata(w, info.attrs.metadata);
+    w.Key("checksums"); write_checksums(w, object_checksums(info));
+    w.Key("parts");
+    w.StartArray();
+    for (auto& p : info.parts) {
+        write_part_info(w, p);
+    }
+    w.EndArray();
     w.EndObject();
 }
 
@@ -150,18 +168,54 @@ static sstring key_param(const request& req) {
     return req.get_path_param("key");
 }
 
+// Calls func(suffix, value) for every header named `prefix` (lower case)
+// followed by a non-empty suffix, with the suffix lower-cased.
+template <typename Func>
+static void for_each_prefixed_header(const request& req, std::string_view prefix, Func func) {
+    for (auto& [name, value] : req._headers) {
+        if (name.size() > prefix.size()
+                && std::ranges::equal(std::string_view(name).substr(0, prefix.size()), prefix,
+                                      [] (char a, char b) { return std::tolower(a) == b; })) {
+            sstring suffix = name.substr(prefix.size());
+            std::ranges::transform(suffix, suffix.begin(), [] (char c) { return std::tolower(c); });
+            func(suffix, value);
+        }
+    }
+}
+
+static checksum_algorithm parse_checksum_algorithm(std::string_view name) {
+    auto alg = checksum_algorithm_from_string(name);
+    if (!alg) {
+        throw bad_request(fmt::format("unknown checksum algorithm '{}'", name));
+    }
+    return *alg;
+}
+
 static object_attrs attrs_from_headers(const request& req) {
     object_attrs attrs;
-    for (auto& [name, value] : req._headers) {
-        if (name.size() > meta_header_prefix.size()
-                && std::ranges::equal(std::string_view(name).substr(0, meta_header_prefix.size()), meta_header_prefix,
-                                      [] (char a, char b) { return std::tolower(a) == b; })) {
-            sstring k = name.substr(meta_header_prefix.size());
-            std::ranges::transform(k, k.begin(), [] (char c) { return std::tolower(c); });
-            attrs.metadata[k] = value;
+    for_each_prefixed_header(req, meta_header_prefix, [&] (const sstring& k, const sstring& value) {
+        attrs.metadata[k] = value;
+    });
+    auto algs = req.get_header("X-Labaz-Checksums");
+    for (auto name : std::string_view(algs) | std::views::split(',')) {
+        if (!algs.empty()) {
+            attrs.checksums.insert(parse_checksum_algorithm(std::string_view(name)));
         }
     }
     return attrs;
+}
+
+// The checksums the body must have, from X-Labaz-Checksum-<algorithm>.
+static checksums expected_checksums(const request& req) {
+    checksums ret;
+    for_each_prefixed_header(req, checksum_header_prefix, [&] (const sstring& name, const sstring& value) {
+        auto bytes = from_hex(value);
+        if (!bytes) {
+            throw bad_request(fmt::format("bad {} checksum '{}'", name, value));
+        }
+        ret.emplace(parse_checksum_algorithm(name), std::move(*bytes));
+    });
+    return ret;
 }
 
 static precondition precondition_from_headers(const request& req) {
@@ -244,13 +298,19 @@ static bool is_copy_request(const request& req, bool allowed) {
     if (copy && !allowed) {
         throw bad_request("unexpected 'copy-key'");
     }
+    if (copy && !expected_checksums(req).empty()) {
+        throw bad_request("a copy has no body to verify");
+    }
     return copy;
 }
 
 static void add_object_headers(reply& rep, const object_info& info) {
     rep.add_header("X-Labaz-Size", fmt::to_string(info.size));
     rep.add_header("X-Labaz-Generation", fmt::to_string(info.generation));
-    for (auto& [k, v] : info.metadata) {
+    for (auto& [alg, value] : object_checksums(info)) {
+        rep.add_header(fmt::format("X-Labaz-Checksum-{}", to_string(alg)), to_hex(value));
+    }
+    for (auto& [k, v] : info.attrs.metadata) {
         rep.add_header(fmt::format("X-Labaz-Meta-{}", k), v);
     }
 }
@@ -290,6 +350,8 @@ public:
             co_return error_reply(error_status(e.code()), to_string(e.code()), e.what());
         } catch (const bad_request& e) {
             co_return error_reply(status::bad_request, "bad_request", e.what());
+        } catch (const checksum_mismatch& e) {
+            co_return error_reply(status::bad_request, "bad_digest", e.what());
         }
     }
 };
@@ -440,7 +502,7 @@ private:
 
     future<std::unique_ptr<reply>> put_object(request& req, std::unique_ptr<reply> rep) {
         return single_part_upload(req, std::move(rep), [this, &req] (sstring bucket, sstring key, session_id id) {
-            return _storage.write_part(std::move(bucket), std::move(key), std::move(id), 1, *req.content_stream);
+            return write_body(std::move(bucket), std::move(key), std::move(id), 1, req);
         });
     }
 
@@ -500,6 +562,12 @@ private:
             w.Key("bucket"); write_string(w, info.bucket);
             w.Key("key"); write_string(w, info.key);
             w.Key("metadata"); write_metadata(w, info.attrs.metadata);
+            w.Key("checksums");
+            w.StartArray();
+            for (auto alg : info.attrs.checksums) {
+                write_string(w, to_string(alg));
+            }
+            w.EndArray();
             w.Key("parts");
             w.StartArray();
             for (auto& p : info.parts) {
@@ -513,9 +581,19 @@ private:
     // Uploads a part.
     future<std::unique_ptr<reply>> put_session(request& req, std::unique_ptr<reply> rep) {
         auto number = parse_number<unsigned>(req.get_query_param("part"), "part number");
-        auto p = co_await _storage.write_part(bucket_param(req), key_param(req), req.get_query_param("session"), number,
-                                              *req.content_stream);
+        auto p = co_await write_body(bucket_param(req), key_param(req), req.get_query_param("session"), number, req);
         co_return json_reply(std::move(rep), [&] (json_writer& w) { write_part_info(w, p); });
+    }
+
+    // Writes the request body as a part, verified against the
+    // X-Labaz-Checksum-<algorithm> headers, if any.
+    future<part_info> write_body(sstring bucket, sstring key, session_id id, unsigned number, request& req) {
+        auto expected = expected_checksums(req);
+        if (expected.empty()) {
+            co_return co_await _storage.write_part(std::move(bucket), std::move(key), std::move(id), number, *req.content_stream);
+        }
+        auto in = make_verifying_stream(*req.content_stream, std::move(expected));
+        co_return co_await _storage.write_part(std::move(bucket), std::move(key), std::move(id), number, in);
     }
 
     // Aborts the session.

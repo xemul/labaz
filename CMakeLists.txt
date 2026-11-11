@@ -34,9 +34,11 @@ add_subdirectory (seastar EXCLUDE_FROM_ALL)
 
 find_package (RapidJSON REQUIRED)
 find_package (GnuTLS REQUIRED)
+find_package (ZLIB REQUIRED)
 
 add_executable (labaz
   src/main.cc
+  src/checksum.cc
   src/storage.cc
   src/registry.cc
   src/http_frontend.cc
@@ -53,7 +55,8 @@ target_link_libraries (labaz
   PRIVATE
     Seastar::seastar
     RapidJSON
-    GnuTLS::GnuTLS)
+    GnuTLS::GnuTLS
+    ZLIB::ZLIB)
 
 #
 # Tests.

@@ -14,7 +14,7 @@ is one of the storage error codes or `bad_request`:
 
 | Status | Codes |
 |---|---|
-| 400 | `invalid_argument`, `bad_request` |
+| 400 | `invalid_argument`, `bad_request`, `bad_digest` (the body does not match its `X-Labaz-Checksum-<algorithm>`) |
 | 404 | `no_such_bucket`, `no_such_key`, `no_such_session`, `no_such_part` |
 | 409 | `bucket_exists`, `bucket_not_empty` |
 | 412 | `precondition_failed` |
@@ -34,12 +34,13 @@ A request that matches no route gets Seastar's own 404 reply.
 ## Objects
 
 An object info is
-`{"key", "size", "generation", "mtime_ns", "metadata": {}}`.
+`{"key", "size", "generation", "mtime_ns", "metadata": {}, "checksums": {}, "parts": [part info]}`,
+and a part info is `{"number", "size", "checksums": {}}`.
 
 | Request | Reply |
 |---|---|
-| `PUT /{bucket}/{key}` | object info. The body is the data. Optional headers: `X-Labaz-Meta-<name>` (user metadata; names are lower-cased), `X-Labaz-If-Generation-Match` (0: must not exist) |
-| `GET /{bucket}/{key}` | the data; 206 with `Content-Range` if a `Range: bytes=...` header was given (single range only). Headers `X-Labaz-Size`, `X-Labaz-Generation`, `X-Labaz-Meta-<name>` |
+| `PUT /{bucket}/{key}` | object info. The body is the data. Optional headers: `X-Labaz-Meta-<name>` (user metadata; names are lower-cased), `X-Labaz-If-Generation-Match` (0: must not exist), `X-Labaz-Checksums`, `X-Labaz-Checksum-<algorithm>` (see below) |
+| `GET /{bucket}/{key}` | the data; 206 with `Content-Range` if a `Range: bytes=...` header was given (single range only). Headers `X-Labaz-Size`, `X-Labaz-Generation`, `X-Labaz-Meta-<name>`, `X-Labaz-Checksum-<algorithm>` |
 | `HEAD /{bucket}/{key}` | the same headers, no body |
 | `DELETE /{bucket}/{key}` | 204 |
 
@@ -60,6 +61,28 @@ A session belongs to one object; using its id with another object's path is
 
 `part` is only valid together with `session`, on `PUT`; anywhere else, and a
 `PUT ?session` without it, is `bad_request`.
+
+## Checksums
+
+Algorithms: `crc32` (zlib's), `crc32c`, `crc64nvme`, `md5`, `sha1`, `sha256`.
+Values are hex; CRCs are big-endian.
+
+- `X-Labaz-Checksums: <algorithm>,...` on `POST` (open a session) and on a
+  `PUT` of an object (including a copy) selects the checksums the storage
+  computes for every part. The session description lists them.
+- A part info has its part's checksums.
+- An object info's `checksums` (and the `X-Labaz-Checksum-<algorithm>`
+  headers of `GET` and `HEAD`) are of the object's data as a whole, as far as
+  they derive from its parts' ones: those of its only part, those of no data
+  for an object of no parts, and otherwise the CRCs that every part has,
+  combined. MD5 and SHA of an object of several parts are not reported.
+- A copied part has the checksums of its data like a written one. Those
+  that derive from the source's parts (when copying the whole source) are
+  taken from them, the rest are computed by reading the copied data.
+- `X-Labaz-Checksum-<algorithm>: <hex>` on a `PUT` with a body (an object or
+  a part) is verified against the body, which is refused with `bad_digest`
+  if it does not match. It does not make the storage keep that checksum. A
+  copy has no body, so these headers are `bad_request` on it.
 
 ## Copy
 

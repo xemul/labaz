@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -21,6 +22,8 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
+
+#include "checksum.hh"
 
 namespace labaz {
 
@@ -55,6 +58,15 @@ using clock_type = std::chrono::system_clock;
 /// Attributes given when an upload starts and stored with the object.
 struct object_attrs {
     user_metadata metadata;
+    // Computed for every part.
+    std::set<checksum_algorithm> checksums;
+};
+
+struct part_info {
+    unsigned number = 0;
+    uint64_t size = 0;
+    // Of the part's data, for the algorithms of the object's attributes.
+    labaz::checksums checksums;
 };
 
 struct object_info {
@@ -64,13 +76,21 @@ struct object_info {
     // Unique among all versions the key ever had, and grows with every
     // write of the key.
     uint64_t generation = 0;
-    user_metadata metadata;
+    object_attrs attrs;
+    // The parts the object was committed from, in their order.
+    std::vector<part_info> parts;
 };
 
-struct part_info {
-    unsigned number = 0;
-    uint64_t size = 0;
-};
+/// The checksums of the parts' data concatenated, for those of the
+/// algorithms that can be derived from the parts' checksums: all the
+/// checksums of a single part, those of no data for no parts, and otherwise
+/// the CRCs that every part has, combined. Never reads data.
+labaz::checksums concatenated_checksums(const std::vector<part_info>& parts,
+                                        const std::set<checksum_algorithm>& algorithms);
+
+/// The checksums of the object's data as a whole, as far as they can be
+/// derived from its parts' (see concatenated_checksums()).
+labaz::checksums object_checksums(const object_info& info);
 
 using session_id = sstring;
 

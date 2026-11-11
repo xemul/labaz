@@ -3,8 +3,10 @@
 
 """The storage API through the plywood facade, on the potato backend."""
 
+import hashlib
 import os
 import threading
+import zlib
 
 import pytest
 import requests
@@ -234,7 +236,7 @@ def test_list_reports_object_info(plywood):
 
 def test_session(plywood):
     s = plywood.open_session("bkt", "obj", metadata={"m": "v"})
-    assert plywood.put_part("bkt", "obj", s, 3, b"ccc") == {"number": 3, "size": 3}
+    assert plywood.put_part("bkt", "obj", s, 3, b"ccc") == {"number": 3, "size": 3, "checksums": {}}
     plywood.put_part("bkt", "obj", s, 1, b"a")
     plywood.put_part("bkt", "obj", s, 2, b"")
     d = plywood.describe_session("bkt", "obj", s)
@@ -465,7 +467,7 @@ def test_copy_empty_object(plywood):
 def test_copy_parts(plywood):
     plywood.put("bkt", "src", b"0123456789")
     s = plywood.open_session("bkt", "dst")
-    assert plywood.copy_part("bkt", "dst", s, 1, "src", range="bytes=5-") == {"number": 1, "size": 5}
+    assert plywood.copy_part("bkt", "dst", s, 1, "src", range="bytes=5-") == {"number": 1, "size": 5, "checksums": {}}
     plywood.put_part("bkt", "dst", s, 2, b"-")
     plywood.copy_part("bkt", "dst", s, 3, "src", range="bytes=0-4")
     plywood.copy_part("bkt", "dst", s, 4, "src")
@@ -528,6 +530,199 @@ def test_copy_key_not_on_put(plywood, method):
     assert plywood.read("bkt", "obj") == b"x"
 
 
+# Checksums
+
+ALGORITHMS = ["crc32", "crc32c", "crc64nvme", "md5", "sha1", "sha256"]
+CRCS = ["crc32", "crc32c", "crc64nvme"]
+
+
+def reflected_crc(data: bytes, poly: int, width: int) -> bytes:
+    mask = (1 << width) - 1
+    crc = mask
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ poly if crc & 1 else crc >> 1
+    return (crc ^ mask).to_bytes(width // 8, "big")
+
+
+def digest(alg: str, data: bytes) -> str:
+    """The reference value of a checksum, in hex."""
+    if alg == "crc32":
+        return zlib.crc32(data).to_bytes(4, "big").hex()
+    if alg == "crc32c":
+        return reflected_crc(data, 0x82F63B78, 32).hex()
+    if alg == "crc64nvme":
+        return reflected_crc(data, 0x9A6C9329AC4BC9B5, 64).hex()
+    return hashlib.new(alg, data).hexdigest()
+
+
+def digests(algs, data: bytes) -> dict:
+    return {alg: digest(alg, data) for alg in algs}
+
+
+def test_checksum_check_values(plywood):
+    info = plywood.put("bkt", "obj", b"123456789", checksums=ALGORITHMS)
+    assert info["checksums"] == {
+        "crc32": "cbf43926",
+        "crc32c": "e3069283",
+        "crc64nvme": "ae8b14860a799888",
+        "md5": "25f9e794323b453885f5181f1b624d0b",
+        "sha1": "f7c3bc1d808e04732adf679965ccc34ca7ae3441",
+        "sha256": "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225",
+    }
+    assert info["checksums"] == digests(ALGORITHMS, b"123456789")
+
+
+def test_no_checksums_by_default(plywood):
+    info = plywood.put("bkt", "obj", b"data")
+    assert info["checksums"] == {}
+    assert info["parts"] == [{"number": 1, "size": 4, "checksums": {}}]
+
+
+def test_checksums_reported(plywood):
+    data = os.urandom(10_000)
+    info = plywood.put("bkt", "obj", data, checksums=["crc32c", "md5"])
+    expected = digests(["crc32c", "md5"], data)
+    assert info["checksums"] == expected
+    assert info["parts"] == [{"number": 1, "size": len(data), "checksums": expected}]
+    headers = plywood.head("bkt", "obj").headers
+    assert {alg: headers[f"X-Labaz-Checksum-{alg}"] for alg in expected} == expected
+    assert "X-Labaz-Checksum-sha1" not in headers
+    assert plywood.get("bkt", "obj").headers["X-Labaz-Checksum-crc32c"] == expected["crc32c"]
+    [o] = plywood.list("bkt")["objects"]
+    assert o == info
+
+
+@pytest.mark.parametrize("sizes", [
+    [1, 1],
+    [3, 0, 5],
+    [4096, 7, 65537, 0, 1, 100_000],
+])
+def test_multipart_checksums(plywood, sizes):
+    chunks = [os.urandom(n) for n in sizes]
+    s = plywood.open_session("bkt", "obj", checksums=ALGORITHMS)
+    for n, c in enumerate(chunks, 1):
+        assert plywood.put_part("bkt", "obj", s, n, c)["checksums"] == digests(ALGORITHMS, c)
+    assert plywood.describe_session("bkt", "obj", s)["checksums"] == sorted(ALGORITHMS, key=ALGORITHMS.index)
+    info = plywood.commit("bkt", "obj", s)
+    # CRCs are combined from the parts' ones; MD5 and SHA cannot be.
+    assert info["checksums"] == digests(CRCS, b"".join(chunks))
+    assert info["parts"] == [{"number": n, "size": len(c), "checksums": digests(ALGORITHMS, c)}
+                             for n, c in enumerate(chunks, 1)]
+    assert plywood.read("bkt", "obj") == b"".join(chunks)
+
+
+def test_part_order_in_checksums(plywood):
+    s = plywood.open_session("bkt", "obj", checksums=CRCS)
+    plywood.put_part("bkt", "obj", s, 1, b"first")
+    plywood.put_part("bkt", "obj", s, 2, b"second")
+    plywood.put_part("bkt", "obj", s, 3, b"third")
+    info = plywood.commit("bkt", "obj", s, [3, 1])
+    assert info["checksums"] == digests(CRCS, b"thirdfirst")
+    assert [p["number"] for p in info["parts"]] == [3, 1]
+
+
+def test_single_part_session_checksums(plywood):
+    s = plywood.open_session("bkt", "obj", checksums=ALGORITHMS)
+    plywood.put_part("bkt", "obj", s, 1, b"one")
+    plywood.put_part("bkt", "obj", s, 2, b"two")
+    assert plywood.commit("bkt", "obj", s, [2])["checksums"] == digests(ALGORITHMS, b"two")
+
+
+def test_empty_object_checksums(plywood):
+    s = plywood.open_session("bkt", "obj", checksums=ALGORITHMS)
+    info = plywood.commit("bkt", "obj", s, [])
+    assert info["parts"] == []
+    assert info["checksums"] == digests(ALGORITHMS, b"")
+
+
+def test_copy_checksums_of_single_part_source(plywood):
+    plywood.put("bkt", "src", b"0123456789", checksums=ALGORITHMS)
+    info = plywood.copy("bkt", "dst", "src", checksums=ALGORITHMS)
+    assert info["checksums"] == digests(ALGORITHMS, b"0123456789")
+    # A range covering the whole source is the whole source.
+    info = plywood.copy("bkt", "dst", "src", range="bytes=0-", checksums=["md5"])
+    assert info["checksums"] == digests(["md5"], b"0123456789")
+
+
+def test_copy_checksums_of_multipart_source(plywood):
+    chunks = [b"0123", b"", b"45", b"6789"]
+    s = plywood.open_session("bkt", "src", checksums=ALGORITHMS)
+    for n, c in enumerate(chunks, 1):
+        plywood.put_part("bkt", "src", s, n, c)
+    plywood.commit("bkt", "src", s)
+    info = plywood.copy("bkt", "dst", "src", checksums=ALGORITHMS)
+    assert info["parts"][0]["checksums"] == digests(ALGORITHMS, b"0123456789")
+    assert info["checksums"] == digests(ALGORITHMS, b"0123456789")
+
+
+def test_copy_checksums_the_source_lacks(plywood):
+    plywood.put("bkt", "src", b"0123456789", checksums=["crc32"])
+    info = plywood.copy("bkt", "dst", "src", checksums=["crc32", "crc32c", "sha256"])
+    assert info["checksums"] == digests(["crc32", "crc32c", "sha256"], b"0123456789")
+    plywood.put("bkt", "src", b"0123456789")
+    info = plywood.copy("bkt", "dst", "src", checksums=["md5"])
+    assert info["checksums"] == digests(["md5"], b"0123456789")
+
+
+@pytest.mark.parametrize("range,data", [
+    ("bytes=3-7", b"34567"),
+    ("bytes=0-3", b"0123"),
+    ("bytes=-1", b"9"),
+    ("bytes=0-", b"0123456789"),
+])
+def test_copy_range_checksums(plywood, range, data):
+    s = plywood.open_session("bkt", "src", checksums=["crc32c"])
+    for n, c in enumerate([b"0123", b"45", b"6789"], 1):
+        plywood.put_part("bkt", "src", s, n, c)
+    plywood.commit("bkt", "src", s)
+    info = plywood.copy("bkt", "dst", "src", range=range, checksums=ALGORITHMS)
+    assert info["parts"][0]["checksums"] == digests(ALGORITHMS, data)
+
+
+def test_copied_parts_in_object_checksums(plywood):
+    plywood.put("bkt", "src", b"0123456789", checksums=CRCS)
+    s = plywood.open_session("bkt", "obj", checksums=CRCS)
+    plywood.put_part("bkt", "obj", s, 1, b"abc")
+    plywood.copy_part("bkt", "obj", s, 2, "src", range="bytes=-2")
+    plywood.copy_part("bkt", "obj", s, 3, "src")
+    info = plywood.commit("bkt", "obj", s)
+    assert info["checksums"] == digests(CRCS, b"abc890123456789")
+    assert plywood.read("bkt", "obj") == b"abc890123456789"
+
+
+def test_verify_object(plywood):
+    data = b"payload"
+    plywood.put("bkt", "obj", data, verify=digests(["crc32c", "sha1"], data))
+    expect_error("bad_digest", 400, plywood.put, "bkt", "obj", b"other", verify={"md5": digest("md5", data)})
+    assert plywood.read("bkt", "obj") == data
+    # Verifying does not make the storage keep the checksum.
+    assert plywood.head("bkt", "obj").headers.get("X-Labaz-Checksum-crc32c") is None
+
+
+def test_verify_part(plywood):
+    s = plywood.open_session("bkt", "obj", checksums=["crc32"])
+    plywood.put_part("bkt", "obj", s, 1, b"good", verify={"crc32": digest("crc32", b"good")})
+    expect_error("bad_digest", 400, plywood.put_part, "bkt", "obj", s, 2, b"bad",
+                 verify={"crc64nvme": digest("crc64nvme", b"good")})
+    expect_error("bad_digest", 400, plywood.put_part, "bkt", "obj", s, 1, b"bad",
+                 verify={"crc32": digest("crc32", b"good")})
+    parts = plywood.describe_session("bkt", "obj", s)["parts"]
+    assert parts == [{"number": 1, "size": 4, "checksums": digests(["crc32"], b"good")}]
+
+
+def test_bad_checksum_headers(plywood):
+    expect_error("bad_request", 400, plywood.put, "bkt", "obj", b"x", checksums=["crc16"])
+    expect_error("bad_request", 400, plywood.open_session, "bkt", "obj", checksums=["md5", "nope"])
+    expect_error("bad_request", 400, plywood.put, "bkt", "obj", b"x", verify={"crc16": "00"})
+    expect_error("bad_request", 400, plywood.put, "bkt", "obj", b"x", verify={"md5": "xyz"})
+    expect_error("no_such_key", 404, plywood.read, "bkt", "obj")
+    plywood.put("bkt", "src", b"x")
+    expect_error("bad_request", 400, plywood.request, "PUT", "/bkt/dst", params={"copy-key": "src"},
+                 headers={"X-Labaz-Checksum-md5": digest("md5", b"x")})
+
+
 # Protocol
 
 def test_unknown_route(plywood):
@@ -580,7 +775,7 @@ def test_objects_survive_restart(run_labaz, tmp_path):
     server = run_labaz(args)
     c = PlywoodClient(f"http://127.0.0.1:{port}")
     c.create_bucket("bkt")
-    info = c.put("bkt", "a/b", b"payload", metadata={"m": "v"})
+    info = c.put("bkt", "a/b", b"payload", metadata={"m": "v"}, checksums=["crc32c", "md5"])
     assert server.stop() == 0
 
     server.start()

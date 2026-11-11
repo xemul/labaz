@@ -38,8 +38,16 @@ class PlywoodClient:
                         for c in key.split("/"))
 
     @staticmethod
-    def _meta_headers(metadata: dict | None) -> dict:
-        return {f"X-Labaz-Meta-{k}": v for k, v in (metadata or {}).items()}
+    def _meta_headers(metadata: dict | None, checksums: list[str] | None = None) -> dict:
+        headers = {f"X-Labaz-Meta-{k}": v for k, v in (metadata or {}).items()}
+        if checksums is not None:
+            headers["X-Labaz-Checksums"] = ",".join(checksums)
+        return headers
+
+    @staticmethod
+    def _verify_headers(verify: dict | None) -> dict:
+        """verify: {algorithm: hex digest} the body must have."""
+        return {f"X-Labaz-Checksum-{alg}": v for alg, v in (verify or {}).items()}
 
     def _obj(self, bucket: str, key: str) -> str:
         return f"/{bucket}/{self._key(key)}"
@@ -58,8 +66,9 @@ class PlywoodClient:
     # objects
 
     def put(self, bucket: str, key: str, data: bytes, metadata: dict | None = None,
-            generation_match: int | None = None) -> dict:
-        headers = self._meta_headers(metadata)
+            generation_match: int | None = None, checksums: list[str] | None = None,
+            verify: dict | None = None) -> dict:
+        headers = self._meta_headers(metadata, checksums) | self._verify_headers(verify)
         if generation_match is not None:
             headers["X-Labaz-If-Generation-Match"] = str(generation_match)
         return self.request("PUT", self._obj(bucket, key), data=data, headers=headers).json()
@@ -82,8 +91,8 @@ class PlywoodClient:
 
     def copy(self, bucket: str, key: str, src_key: str, range: str | None = None,
              src_generation_match: int | None = None, metadata: dict | None = None,
-             generation_match: int | None = None) -> dict:
-        headers = self._meta_headers(metadata)
+             generation_match: int | None = None, checksums: list[str] | None = None) -> dict:
+        headers = self._meta_headers(metadata, checksums)
         if generation_match is not None:
             headers["X-Labaz-If-Generation-Match"] = str(generation_match)
         return self.request("PUT", self._obj(bucket, key), headers=headers,
@@ -113,13 +122,15 @@ class PlywoodClient:
 
     # sessions
 
-    def open_session(self, bucket: str, key: str, metadata: dict | None = None) -> str:
+    def open_session(self, bucket: str, key: str, metadata: dict | None = None,
+                     checksums: list[str] | None = None) -> str:
         return self.request("POST", self._obj(bucket, key),
-                            headers=self._meta_headers(metadata)).json()["session"]
+                            headers=self._meta_headers(metadata, checksums)).json()["session"]
 
-    def put_part(self, bucket: str, key: str, session: str, number: int, data: bytes) -> dict:
+    def put_part(self, bucket: str, key: str, session: str, number: int, data: bytes,
+                 verify: dict | None = None) -> dict:
         return self.request("PUT", self._obj(bucket, key), params={"session": session, "part": number},
-                            data=data).json()
+                            data=data, headers=self._verify_headers(verify)).json()
 
     def copy_part(self, bucket: str, key: str, session: str, number: int, src_key: str,
                   range: str | None = None, src_generation_match: int | None = None) -> dict:
