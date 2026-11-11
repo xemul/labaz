@@ -39,8 +39,10 @@ find_package (ZLIB REQUIRED)
 add_executable (labaz
   src/main.cc
   src/checksum.cc
+  src/streams.cc
   src/storage.cc
   src/registry.cc
+  src/sharder.cc
   src/http_frontend.cc
   src/plywood/plywood_facade.cc
   src/potato/potato_storage.cc)

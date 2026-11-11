@@ -24,6 +24,7 @@
 #include <seastar/core/sstring.hh>
 
 #include "checksum.hh"
+#include "sharder.hh"
 
 namespace labaz {
 
@@ -142,52 +143,92 @@ struct listing {
     bool truncated = false;
 };
 
-/// The storage backend. There is one instance per shard, and every call is
-/// served by the shard it is made on: the storage does no routing between
-/// shards. Running related calls (e.g. the calls of one upload session) on
-/// the same shard is up to the caller.
+class storage_service;
+
+/// The storage. There is one instance per shard, and every object belongs
+/// to one shard (see sharder): the calls about an object, and about its
+/// upload sessions, are run on that shard, whatever shard they are made on.
+/// Bucket calls and listing run on the shard they are made on.
+///
+/// The public calls do that routing and are the same for every backend.
+/// Backends implement the do_*() calls, each of which is only made on the
+/// shard owning its object, so a backend never deals with other shards.
 ///
 /// Keys are non-empty and must not end with '/'.
 class storage {
+    friend class storage_service;
+
+    sharder _sharder;
+    storage_service* _service = nullptr;
+
 public:
     virtual ~storage() = default;
 
     virtual future<> start() = 0;
     virtual future<> stop() = 0;
 
-    virtual future<> create_bucket(sstring bucket) = 0;
+    future<> create_bucket(sstring bucket);
     /// Fails with bucket_not_empty if the bucket has objects or sessions.
-    virtual future<> delete_bucket(sstring bucket) = 0;
-    virtual future<std::vector<sstring>> list_buckets() = 0;
+    future<> delete_bucket(sstring bucket);
+    future<std::vector<sstring>> list_buckets();
 
     // A session is addressed by its object's bucket and key along with its
     // id; a session of another object is reported as no_such_session.
 
-    virtual future<session_id> open_session(sstring bucket, sstring key, object_attrs attrs) = 0;
+    future<session_id> open_session(sstring bucket, sstring key, object_attrs attrs);
     /// Reads `in` to its end as part `number` of the session, replacing an
     /// earlier part with the same number. On failure the part is discarded.
     /// The stream stays the caller's: it is not closed.
-    virtual future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number,
-                                         seastar::input_stream<char>& in) = 0;
+    future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                 seastar::input_stream<char>& in);
     /// Makes the bytes of the bucket's object `src_key` (all of them, or the
     /// range) part `number` of the session, replacing an earlier part with
     /// the same number. `src_pre` is checked against the source object.
-    virtual future<part_info> copy_part(sstring bucket, sstring key, session_id id, unsigned number,
-                                        sstring src_key, std::optional<byte_range> range, precondition src_pre) = 0;
-    virtual future<session_info> describe_session(sstring bucket, sstring key, session_id id) = 0;
+    future<part_info> copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                sstring src_key, std::optional<byte_range> range, precondition src_pre);
+    future<session_info> describe_session(sstring bucket, sstring key, session_id id);
     /// Publishes the listed parts, in the given order, as the session's
     /// object, replacing the current version atomically. Parts not listed
     /// are dropped. Committing an already committed session returns the
     /// same result again.
-    virtual future<object_info> commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
-                                               precondition pre) = 0;
-    virtual future<> abort_session(sstring bucket, sstring key, session_id id) = 0;
+    future<object_info> commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
+                                       precondition pre);
+    future<> abort_session(sstring bucket, sstring key, session_id id);
 
-    virtual future<object_info> head_object(sstring bucket, sstring key) = 0;
-    virtual future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range) = 0;
-    virtual future<> delete_object(sstring bucket, sstring key) = 0;
+    future<object_info> head_object(sstring bucket, sstring key);
+    future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range);
+    future<> delete_object(sstring bucket, sstring key);
     /// Keys in byte order, starting after `start_after`.
-    virtual future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) = 0;
+    future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys);
+
+protected:
+    // The calls above, on the right shard.
+    virtual future<> do_create_bucket(sstring bucket) = 0;
+    virtual future<> do_delete_bucket(sstring bucket) = 0;
+    virtual future<std::vector<sstring>> do_list_buckets() = 0;
+    virtual future<session_id> do_open_session(sstring bucket, sstring key, object_attrs attrs) = 0;
+    virtual future<part_info> do_write_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                            seastar::input_stream<char>& in) = 0;
+    virtual future<part_info> do_copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                           sstring src_key, std::optional<byte_range> range, precondition src_pre) = 0;
+    virtual future<session_info> do_describe_session(sstring bucket, sstring key, session_id id) = 0;
+    virtual future<object_info> do_commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
+                                                  precondition pre) = 0;
+    virtual future<> do_abort_session(sstring bucket, sstring key, session_id id) = 0;
+    virtual future<object_info> do_head_object(sstring bucket, sstring key) = 0;
+    virtual future<object_reader> do_read_object(sstring bucket, sstring key, std::optional<byte_range> range) = 0;
+    virtual future<> do_delete_object(sstring bucket, sstring key) = 0;
+    virtual future<listing> do_list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) = 0;
+
+private:
+    unsigned owner_of(std::string_view bucket, std::string_view key) const {
+        return _sharder.shard_of(bucket, key);
+    }
+
+    // Runs func(storage&) with the storage of the given shard; its result
+    // moves to this shard.
+    template <typename Func>
+    auto invoke_on(unsigned shard, Func func);
 };
 
 /// A backend type, selected with --backend.
@@ -204,7 +245,7 @@ const std::vector<backend_type>& backend_types();
 const backend_type* find_backend_type(std::string_view name);
 
 /// Holds the shard's backend instance.
-class storage_service {
+class storage_service : public seastar::peering_sharded_service<storage_service> {
     std::unique_ptr<storage> _impl;
 public:
     storage_service(const backend_type& type, const boost::program_options::variables_map& opts);

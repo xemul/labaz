@@ -7,6 +7,10 @@
 
 #include <algorithm>
 
+#include <seastar/core/smp.hh>
+
+#include "streams.hh"
+
 namespace labaz {
 
 std::string_view to_string(errc e) {
@@ -62,6 +66,122 @@ checksums concatenated_checksums(const std::vector<part_info>& parts, const std:
 
 checksums object_checksums(const object_info& info) {
     return concatenated_checksums(info.parts, info.attrs.checksums);
+}
+
+//
+// Routing calls to the shard owning their object
+//
+
+using namespace seastar;
+
+template <typename Func>
+auto storage::invoke_on(unsigned shard, Func func) {
+    return _service->container().invoke_on(shard, [func = std::move(func)] (storage_service& s) mutable {
+        return func(s.get());
+    });
+}
+
+// FIXME: bucket calls and listing run on the shard they are made on. That
+// is enough for a backend whose shards share all the data (potato), but one
+// keeping data per shard needs them fanned out to all shards (and listings
+// merged).
+
+future<> storage::create_bucket(sstring bucket) {
+    return do_create_bucket(std::move(bucket));
+}
+
+future<> storage::delete_bucket(sstring bucket) {
+    return do_delete_bucket(std::move(bucket));
+}
+
+future<std::vector<sstring>> storage::list_buckets() {
+    return do_list_buckets();
+}
+
+future<listing> storage::list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) {
+    return do_list_objects(std::move(bucket), std::move(prefix), std::move(start_after), max_keys);
+}
+
+future<session_id> storage::open_session(sstring bucket, sstring key, object_attrs attrs) {
+    return invoke_on(owner_of(bucket, key), [bucket, key, attrs = std::move(attrs)] (storage& s) {
+        return s.do_open_session(bucket, key, attrs);
+    });
+}
+
+future<part_info> storage::write_part(sstring bucket, sstring key, session_id id, unsigned number, input_stream<char>& in) {
+    auto owner = owner_of(bucket, key);
+    if (owner == this_shard_id()) {
+        return do_write_part(std::move(bucket), std::move(key), std::move(id), number, in);
+    }
+    // The owner reads `in` from this shard, which waits for it to finish.
+    return invoke_on(owner, [bucket, key, id, number, &in, from = this_shard_id()] (storage& s) {
+        return do_with(make_foreign_stream(from, in, deleter()), [&s, bucket, key, id, number] (input_stream<char>& foreign) {
+            return s.do_write_part(bucket, key, id, number, foreign);
+        });
+    });
+}
+
+future<part_info> storage::copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                     sstring src_key, std::optional<byte_range> range, precondition src_pre) {
+    return invoke_on(owner_of(bucket, key), [=] (storage& s) {
+        return s.do_copy_part(bucket, key, id, number, src_key, range, src_pre);
+    });
+}
+
+future<session_info> storage::describe_session(sstring bucket, sstring key, session_id id) {
+    return invoke_on(owner_of(bucket, key), [bucket, key, id] (storage& s) {
+        return s.do_describe_session(bucket, key, id);
+    });
+}
+
+future<object_info> storage::commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
+                                            precondition pre) {
+    return invoke_on(owner_of(bucket, key), [bucket, key, id, parts = std::move(parts), pre] (storage& s) {
+        return s.do_commit_session(bucket, key, id, parts, pre);
+    });
+}
+
+future<> storage::abort_session(sstring bucket, sstring key, session_id id) {
+    return invoke_on(owner_of(bucket, key), [bucket, key, id] (storage& s) {
+        return s.do_abort_session(bucket, key, id);
+    });
+}
+
+future<object_info> storage::head_object(sstring bucket, sstring key) {
+    return invoke_on(owner_of(bucket, key), [bucket, key] (storage& s) {
+        return s.do_head_object(bucket, key);
+    });
+}
+
+future<> storage::delete_object(sstring bucket, sstring key) {
+    return invoke_on(owner_of(bucket, key), [bucket, key] (storage& s) {
+        return s.do_delete_object(bucket, key);
+    });
+}
+
+namespace {
+
+// A reader whose stream stays on the shard that made it.
+struct parked_reader {
+    object_info info;
+    foreign_ptr<std::unique_ptr<input_stream<char>>> data;
+};
+
+}
+
+future<object_reader> storage::read_object(sstring bucket, sstring key, std::optional<byte_range> range) {
+    auto owner = owner_of(bucket, key);
+    if (owner == this_shard_id()) {
+        return do_read_object(std::move(bucket), std::move(key), range);
+    }
+    return invoke_on(owner, [bucket, key, range] (storage& s) {
+        return s.do_read_object(bucket, key, range).then([] (object_reader r) {
+            return parked_reader{std::move(r.info), make_foreign(std::make_unique<input_stream<char>>(std::move(r.data)))};
+        });
+    }).then([owner] (parked_reader r) {
+        auto& in = *r.data;
+        return object_reader{std::move(r.info), make_foreign_stream(owner, in, make_object_deleter(std::move(r.data)))};
+    });
 }
 
 } // namespace labaz

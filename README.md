@@ -35,8 +35,9 @@ build/dev/labaz --smp 1 -m 1G \
 - `--backend <name>` selects the storage; see [docs/backends.md](docs/backends.md).
 - `--help` lists the available facades and backends with their options.
 
-Run it with `--smp 1` for now: requests are not yet routed between shards,
-and the storage serves each call on the shard that receives it.
+Every object is owned by one shard (`src/sharder.*`). The storage runs the
+calls about an object on that shard, whichever shard received the request,
+and streams the data between the two.
 
 Once all facades listen, the server prints `labaz: ready` to stdout. It stops
 on SIGINT or SIGTERM.
@@ -57,8 +58,11 @@ They need `pytest`, `requests` and the `openssl` command.
 
 | Path | What |
 |---|---|
-| `src/storage.hh` | The storage (backend) interface and neutral error codes |
+| `src/storage.*` | The storage interface, routing calls to the owner shard, and neutral error codes |
 | `src/facade.hh` | The facade (protocol) interface |
+| `src/sharder.*` | Which shard owns an object |
+| `src/streams.*` | Reading streams of other shards |
+| `src/checksum.*` | Checksums |
 | `src/registry.cc` | The list of built-in backends and facades |
 | `src/potato/` | The potato backend |
 | `src/plywood/` | The plywood facade |

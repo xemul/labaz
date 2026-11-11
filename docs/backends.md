@@ -46,10 +46,11 @@ Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
   data is only read if the session wants checksums that cannot be derived.
   The meta keeps the object's parts (sizes and checksums) besides its
   slices.
-- Every call is served on the shard it is made on; there is no routing
-  between shards. Sessions live in the memory of the shard that opened them,
-  so all calls of a session must come to that shard. Until the facades route
-  requests, run with `--smp 1`.
+- Every `do_*()` call is made on the shard owning its object (the generic
+  `storage` routes them there), so sessions can live in the memory of the
+  shard that opened them. All shards share the data directory, so a restart
+  with another number of shards finds every object; only in-progress
+  sessions are lost, as on any restart.
 
 Limitations, by design:
 

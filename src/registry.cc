@@ -47,7 +47,9 @@ const facade_type* find_facade_type(std::string_view name) {
 
 storage_service::storage_service(const backend_type& type, const boost::program_options::variables_map& opts)
     : _impl(type.make(opts))
-{}
+{
+    _impl->_service = this;
+}
 
 future<> storage_service::stop() {
     return _impl->stop();
