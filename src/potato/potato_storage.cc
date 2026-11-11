@@ -259,8 +259,6 @@ public:
 // The storage
 //
 
-class potato_storage;
-
 struct sealed_part {
     sstring name;
     uint64_t size;
@@ -276,35 +274,6 @@ struct session_state {
     std::optional<object_info> committed;
 };
 
-class potato_part_writer final : public part_writer {
-    potato_storage& _storage;
-    sstring _bucket;
-    sstring _key;
-    session_id _id;
-    unsigned _number;
-    fs::path _tmp;
-    fs::path _final;
-    output_stream<char> _out;
-    bool _closed = false;
-
-public:
-    potato_part_writer(potato_storage& s, sstring bucket, sstring key, session_id id, unsigned number,
-                       fs::path tmp, fs::path final, output_stream<char> out)
-        : _storage(s), _bucket(std::move(bucket)), _key(std::move(key)), _id(std::move(id)), _number(number)
-        , _tmp(std::move(tmp)), _final(std::move(final)), _out(std::move(out))
-    {}
-
-    ~potato_part_writer() {
-        if (!_closed) {
-            plog.error("part {} of session {} was neither sealed nor aborted", _number, _id);
-        }
-    }
-
-    output_stream<char>& out() override { return _out; }
-    future<part_info> seal() override;
-    future<> abort() override;
-};
-
 class potato_storage final : public storage {
     fs::path _root;
     std::unordered_map<session_id, session_state> _sessions;
@@ -315,8 +284,6 @@ class potato_storage final : public storage {
     // object directory is not removed meanwhile. Objects of a shard are
     // served by that shard only, so a shard-wide lock covers all of them.
     rwlock _lock;
-
-    friend class potato_part_writer;
 
 public:
     explicit potato_storage(fs::path root)
@@ -379,14 +346,34 @@ public:
         co_return id;
     }
 
-    future<std::unique_ptr<part_writer>> write_part(sstring bucket, sstring key, session_id id, unsigned number) override {
+    future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number, input_stream<char>& in) override {
         active_session(bucket, key, id);
         auto final = session_dir(bucket, key, id) / fmt::format("{}{}.{:x}", part_prefix, number, next_unique());
         auto tmp = fs::path(final.native() + ".tmp");
         auto f = co_await open_file_dma(tmp.native(), open_flags::wo | open_flags::create | open_flags::exclusive);
         auto out = co_await make_file_output_stream(std::move(f));
-        co_return std::make_unique<potato_part_writer>(*this, std::move(bucket), std::move(key), std::move(id), number,
-                                                       std::move(tmp), std::move(final), std::move(out));
+        std::exception_ptr ex;
+        try {
+            co_await copy(in, out);
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        auto closed = co_await coroutine::as_future(out.close());
+        if (closed.failed()) {
+            auto e = closed.get_exception();
+            if (!ex) {
+                ex = std::move(e);
+            }
+        }
+        if (ex) {
+            // Report the original error, not a failure to clean up after it.
+            auto removed = co_await coroutine::as_future(remove_file(tmp.native()));
+            removed.ignore_ready_future();
+            std::rethrow_exception(ex);
+        }
+        co_await rename_file(tmp.native(), final.native());
+        auto size = co_await file_size(final.native());
+        co_return co_await add_part(bucket, key, id, number, sealed_part{final.filename().native(), size});
     }
 
     future<session_info> describe_session(sstring bucket, sstring key, session_id id) override {
@@ -655,7 +642,8 @@ private:
         co_return m.info;
     }
 
-    // Runs when a part writer seals its part.
+    // Makes a written part a member of its session, unless the session went
+    // away while the part was being written.
     future<part_info> add_part(const sstring& bucket, const sstring& key, const session_id& id, unsigned number, sealed_part part) {
         auto it = _sessions.find(id);
         if (it == _sessions.end() || it->second.bucket != bucket || it->second.key != key
@@ -678,22 +666,6 @@ private:
         co_return ret;
     }
 };
-
-future<part_info> potato_part_writer::seal() {
-    _closed = true;
-    co_await _out.close();
-    co_await rename_file(_tmp.native(), _final.native());
-    auto size = co_await file_size(_final.native());
-    co_return co_await _storage.add_part(_bucket, _key, _id, _number,
-            sealed_part{_final.filename().native(), size});
-}
-
-future<> potato_part_writer::abort() {
-    _closed = true;
-    auto f = co_await coroutine::as_future(_out.close());
-    f.ignore_ready_future();
-    co_await remove_file(_tmp.native());
-}
 
 backend_type make_backend_type() {
     return backend_type{

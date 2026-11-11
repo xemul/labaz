@@ -408,7 +408,7 @@ private:
         object_info info;
         std::exception_ptr ex;
         try {
-            co_await write_part(bucket, key, id, 1, req);
+            co_await _storage.write_part(bucket, key, id, 1, *req.content_stream);
             info = co_await _storage.commit_session(bucket, key, id, {1}, pre);
         } catch (...) {
             ex = std::current_exception();
@@ -456,26 +456,11 @@ private:
         });
     }
 
-    // Writes the request body as a part and seals it.
-    future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number, request& req) {
-        auto w = co_await _storage.write_part(std::move(bucket), std::move(key), std::move(id), number);
-        std::exception_ptr ex;
-        try {
-            co_await copy(*req.content_stream, w->out());
-        } catch (...) {
-            ex = std::current_exception();
-        }
-        if (ex) {
-            co_await w->abort();
-            std::rethrow_exception(ex);
-        }
-        co_return co_await w->seal();
-    }
-
     // Uploads a part.
     future<std::unique_ptr<reply>> put_session(request& req, std::unique_ptr<reply> rep) {
         auto number = parse_number<unsigned>(req.get_query_param("part"), "part number");
-        auto p = co_await write_part(bucket_param(req), key_param(req), req.get_query_param("session"), number, req);
+        auto p = co_await _storage.write_part(bucket_param(req), key_param(req), req.get_query_param("session"), number,
+                                              *req.content_stream);
         co_return json_reply(std::move(rep), [&] (json_writer& w) { write_part_info(w, p); });
     }
 

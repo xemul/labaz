@@ -122,18 +122,6 @@ struct listing {
     bool truncated = false;
 };
 
-/// Writes one part of an upload session.
-class part_writer {
-public:
-    virtual ~part_writer() = default;
-    virtual seastar::output_stream<char>& out() = 0;
-    /// Closes the stream and makes the part a member of the session,
-    /// replacing an earlier part with the same number.
-    virtual future<part_info> seal() = 0;
-    /// Closes the stream and discards the data.
-    virtual future<> abort() = 0;
-};
-
 /// The storage backend. There is one instance per shard, and every call is
 /// served by the shard it is made on: the storage does no routing between
 /// shards. Running related calls (e.g. the calls of one upload session) on
@@ -156,7 +144,11 @@ public:
     // id; a session of another object is reported as no_such_session.
 
     virtual future<session_id> open_session(sstring bucket, sstring key, object_attrs attrs) = 0;
-    virtual future<std::unique_ptr<part_writer>> write_part(sstring bucket, sstring key, session_id id, unsigned number) = 0;
+    /// Reads `in` to its end as part `number` of the session, replacing an
+    /// earlier part with the same number. On failure the part is discarded.
+    /// The stream stays the caller's: it is not closed.
+    virtual future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                         seastar::input_stream<char>& in) = 0;
     virtual future<session_info> describe_session(sstring bucket, sstring key, session_id id) = 0;
     /// Publishes the listed parts, in the given order, as the session's
     /// object, replacing the current version atomically. Parts not listed
