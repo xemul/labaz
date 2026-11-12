@@ -202,6 +202,19 @@ static sstring http_date(clock_type::time_point t) {
     return sstring(buf, n);
 }
 
+// Parses an HTTP date in any of the formats HTTP allows: IMF-fixdate (as
+// http_date() writes it), RFC 850 and asctime.
+static std::optional<clock_type::time_point> parse_http_date(const sstring& s) {
+    for (auto format : {"%a, %d %b %Y %H:%M:%S GMT", "%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"}) {
+        struct tm tm = {};
+        auto end = strptime(s.c_str(), format, &tm);
+        if (end && *end == '\0') {
+            return clock_type::from_time_t(timegm(&tm));
+        }
+    }
+    return std::nullopt;
+}
+
 // "2009-10-12T17:50:30.000Z"
 static sstring iso8601_date(clock_type::time_point t) {
     auto tt = clock_type::to_time_t(t);
@@ -451,6 +464,16 @@ static upload_checksums upload_checksums_from_headers(const request& req) {
     return ret;
 }
 
+static bool is_storage_error(const std::exception_ptr& ep, errc code) {
+    try {
+        std::rethrow_exception(ep);
+    } catch (const storage_error& e) {
+        return e.code() == code;
+    } catch (...) {
+        return false;
+    }
+}
+
 // Request bodies must be plain: aws-chunked ones carry chunk signatures
 // and trailers.
 static void check_plain_body(const request& req) {
@@ -672,9 +695,83 @@ static uint64_t set_range(reply& rep, const std::optional<byte_range>& range, ui
     return rr.length;
 }
 
-// Conditional reads are not implemented.
+// Whether the comma-separated entity tags of an If-Match or If-None-Match
+// header include the ETag, comparing weakly or strongly (where weak tags,
+// W/"...", match nothing); "*" includes any. Tags may come without quotes.
+static bool etag_listed(std::string_view header, std::string_view tag, bool weak) {
+    auto unquoted = [] (std::string_view t) {
+        return t.size() >= 2 && t.front() == '"' && t.back() == '"' ? t.substr(1, t.size() - 2) : t;
+    };
+    tag = unquoted(tag);
+    for (auto part : header | std::views::split(',')) {
+        std::string_view t(part.begin(), part.end());
+        while (!t.empty() && t.front() == ' ') {
+            t.remove_prefix(1);
+        }
+        while (!t.empty() && t.back() == ' ') {
+            t.remove_suffix(1);
+        }
+        if (t == "*") {
+            return true;
+        }
+        if (t.starts_with("W/")) {
+            if (!weak) {
+                continue;
+            }
+            t.remove_prefix(2);
+        }
+        if (unquoted(t) == tag) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Evaluates the conditional headers of GetObject and HeadObject against
+// the version of the object read, in the order HTTP does, and returns the
+// status to reply with instead of the object, if any: 412 or 304. A date
+// that does not parse makes its header ignored.
+static std::optional<status> check_conditions(const request& req, const object_info& info) {
+    auto tag = etag(info);
+    // As Last-Modified reports it.
+    auto modified = std::chrono::time_point_cast<std::chrono::seconds>(info.mtime);
+    if (req._headers.contains("If-Match")) {
+        if (!etag_listed(req.get_header("If-Match"), tag, false)) {
+            return static_cast<status>(412);
+        }
+    } else if (auto date = parse_http_date(req.get_header("If-Unmodified-Since"))) {
+        if (modified > *date) {
+            return static_cast<status>(412);
+        }
+    }
+    if (req._headers.contains("If-None-Match")) {
+        if (etag_listed(req.get_header("If-None-Match"), tag, true)) {
+            return status::not_modified;
+        }
+    } else if (auto date = parse_http_date(req.get_header("If-Modified-Since"))) {
+        if (modified <= *date) {
+            return status::not_modified;
+        }
+    }
+    return std::nullopt;
+}
+
+// The reply to a read whose conditions failed with `st`: a 412 error, or a
+// 304 with the object's ETag and Last-Modified and no body.
+static std::unique_ptr<reply> condition_reply(std::unique_ptr<reply> rep, const object_info& info, status st) {
+    if (st != status::not_modified) {
+        throw storage_error(errc::precondition_failed, "");
+    }
+    rep->add_header("ETag", etag(info));
+    rep->add_header("Last-Modified", http_date(info.mtime));
+    rep->set_status(st);
+    rep->skip_body();
+    // The length a 200 would have; skip_body() keeps the writer from being called.
+    rep->write_body(std::nullopt, info.size, [] (output_stream<char>&) { return make_ready_future(); });
+    return rep;
+}
+
 static void check_read_headers(const request& req) {
-    reject_headers(req, {"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"});
     reject_query_params(req, {"acl", "attributes", "legal-hold", "partNumber", "restore", "retention", "select",
                               "tagging", "torrent", "uploads", "versionId",
                               "response-cache-control", "response-content-disposition", "response-content-encoding",
@@ -1065,7 +1162,27 @@ private:
     future<std::unique_ptr<reply>> get_whole_object(request& req, std::unique_ptr<reply> rep) {
         check_read_headers(req);
         auto range = range_from_headers(req);
-        auto r = co_await _storage.read_object(bucket_param(req), key_param(req), range);
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto f = co_await coroutine::as_future(_storage.read_object(bucket, key, range));
+        if (f.failed()) {
+            // The conditions go before the range, so a range the object
+            // does not have is only reported if they hold.
+            auto ex = f.get_exception();
+            if (!is_storage_error(ex, errc::invalid_range)) {
+                std::rethrow_exception(ex);
+            }
+            auto info = co_await _storage.head_object(bucket, key);
+            if (auto st = check_conditions(req, info)) {
+                co_return condition_reply(std::move(rep), info, *st);
+            }
+            std::rethrow_exception(ex);
+        }
+        auto r = f.get();
+        if (auto st = check_conditions(req, r.info)) {
+            co_await r.data.close();
+            co_return condition_reply(std::move(rep), r.info, *st);
+        }
         add_object_headers(*rep, req, r.info, !range);
         // The storage resolved the range already, so this does not throw.
         auto length = set_range(*rep, range, r.info.size);
@@ -1079,6 +1196,9 @@ private:
         check_read_headers(req);
         auto range = range_from_headers(req);
         auto info = co_await _storage.head_object(bucket_param(req), key_param(req));
+        if (auto st = check_conditions(req, info)) {
+            co_return condition_reply(std::move(rep), info, *st);
+        }
         add_object_headers(*rep, req, info, !range);
         auto length = set_range(*rep, range, info.size);
         // A reply to HEAD reports the length without writing the body.

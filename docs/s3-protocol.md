@@ -49,8 +49,8 @@ Every reply has an `x-amz-request-id` header. Replies to `HEAD` have no body.
 | Operation | Request | Notes |
 |---|---|---|
 | PutObject | `PUT /{bucket}/{key}` | `x-amz-meta-*`, checksums (below), `If-None-Match: *` |
-| GetObject | `GET /{bucket}/{key}` | a single `Range: bytes=...`; an unparsable `Range` is ignored, as S3 does |
-| HeadObject | `HEAD /{bucket}/{key}` | the same headers as GetObject, `Range` included |
+| GetObject | `GET /{bucket}/{key}` | a single `Range: bytes=...`; an unparsable `Range` is ignored, as S3 does; conditions (below) |
+| HeadObject | `HEAD /{bucket}/{key}` | the same headers as GetObject, `Range` and conditions included |
 | DeleteObject | `DELETE /{bucket}/{key}` | 204, also if the key does not exist |
 
 GetObject and HeadObject reply with `Content-Length`, `ETag`, `Last-Modified`,
@@ -61,6 +61,16 @@ The `ETag` of an object is S3's: the quoted hex MD5 of its data for
 PutObject, and for a multipart upload the MD5 of the parts' MD5s followed by
 `-<number of parts>`, whatever the number. Objects written without MD5s
 (through another facade) get an opaque ETag.
+
+GetObject and HeadObject take the conditions `If-Match`, `If-None-Match`,
+`If-Modified-Since` and `If-Unmodified-Since`, evaluated against the
+version read, in HTTP's order and before the range: a failed `If-Match` or
+`If-Unmodified-Since` gives `412 PreconditionFailed`, a failed
+`If-None-Match` or `If-Modified-Since` gives `304 Not Modified` with the
+object's `ETag` and `Last-Modified`. Entity tags may be listed, `*`, weak
+(`W/`, which never matches `If-Match`) or unquoted; dates are HTTP dates in
+any of HTTP's three formats, compared at the one-second resolution of
+`Last-Modified`, and a date that does not parse is ignored.
 
 Keys are up to 1024 bytes (`KeyTooLongError`). Keys ending with `/` are not
 supported and are refused with `InvalidArgument`.
@@ -122,9 +132,6 @@ in byte order. Entries have `Key`, `LastModified`, `ETag`, `Size`,
 - ListMultipartUploads: the storage does not list sessions.
 - Object tagging.
 - DeleteObjects, versioning and every other bucket sub-resource.
-- Conditional reads (`If-Match`, `If-None-Match`, `If-Modified-Since`,
-  `If-Unmodified-Since`). boto3's `download_file` sends `If-Match` with its
-  ranged reads, so it fails.
 - Conditional writes other than `If-None-Match: *`, `response-*` overrides,
   `partNumber` reads.
 - Stored system metadata: `Content-Type`, `Cache-Control` and the like

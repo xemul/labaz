@@ -104,6 +104,100 @@ def test_key_too_long(s3):
     expect_error("KeyTooLongError", 400, s3.put_object, Bucket="bkt", Key="x" * 1025, Body=b"")
 
 
+# Conditional reads
+
+@pytest.fixture
+def versioned(s3):
+    """An object, with its ETag and Last-Modified, and dates before and
+    after the latter."""
+    s3.put_object(Bucket="bkt", Key="k", Body=b"0123456789")
+    h = s3.head_object(Bucket="bkt", Key="k")
+    second = datetime.timedelta(seconds=1)
+    return h["ETag"], h["LastModified"], h["LastModified"] - second, h["LastModified"] + second
+
+
+def read_with(s3, method: str, **conditions) -> int:
+    """The status of a GetObject or HeadObject with the conditions."""
+    try:
+        return getattr(s3, method)(Bucket="bkt", Key="k", **conditions)["ResponseMetadata"]["HTTPStatusCode"]
+    except botocore.exceptions.ClientError as e:
+        return e.response["ResponseMetadata"]["HTTPStatusCode"]
+
+
+@pytest.mark.parametrize("method", ["get_object", "head_object"])
+def test_conditions(s3, versioned, method):
+    tag, mtime, before, after = versioned
+    other = '"0123456789abcdef0123456789abcdef"'
+    cases = [
+        ({"IfMatch": tag}, 200),
+        ({"IfMatch": tag.strip('"')}, 200),
+        ({"IfMatch": "*"}, 200),
+        ({"IfMatch": f"{other}, {tag}"}, 200),
+        ({"IfMatch": other}, 412),
+        ({"IfMatch": f"W/{tag}"}, 412),  # If-Match compares strongly
+        ({"IfNoneMatch": tag}, 304),
+        ({"IfNoneMatch": f"W/{tag}"}, 304),
+        ({"IfNoneMatch": "*"}, 304),
+        ({"IfNoneMatch": other}, 200),
+        ({"IfModifiedSince": before}, 200),
+        ({"IfModifiedSince": mtime}, 304),
+        ({"IfModifiedSince": after}, 304),
+        ({"IfUnmodifiedSince": before}, 412),
+        ({"IfUnmodifiedSince": mtime}, 200),
+        ({"IfUnmodifiedSince": after}, 200),
+        # If-Match goes before If-Unmodified-Since, If-None-Match before If-Modified-Since.
+        ({"IfMatch": tag, "IfUnmodifiedSince": before}, 200),
+        ({"IfMatch": other, "IfUnmodifiedSince": after}, 412),
+        ({"IfNoneMatch": tag, "IfModifiedSince": before}, 304),
+        ({"IfNoneMatch": other, "IfModifiedSince": after}, 200),
+        # A failed If-Match goes before a not-modified.
+        ({"IfMatch": other, "IfNoneMatch": tag}, 412),
+    ]
+    for conditions, status in cases:
+        assert read_with(s3, method, **conditions) == status, conditions
+
+
+def test_condition_failure_replies(s3_url, versioned):
+    tag, mtime, _, _ = versioned
+    r = requests.get(f"{s3_url}/bkt/k", headers={"If-None-Match": tag})
+    assert (r.status_code, r.content, r.headers["ETag"]) == (304, b"", tag)
+    assert r.headers["Last-Modified"] == mtime.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    r = requests.get(f"{s3_url}/bkt/k", headers={"If-Match": '"other"'})
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (412, "PreconditionFailed")
+
+
+@pytest.mark.parametrize("date", ["Wed, 12 Oct 2009 17:50:00 GMT", "Wednesday, 12-Oct-09 17:50:00 GMT",
+                                  "Wed Oct 12 17:50:00 2009"])
+def test_condition_date_formats(s3_url, versioned, date):
+    assert requests.get(f"{s3_url}/bkt/k", headers={"If-Unmodified-Since": date}).status_code == 412
+    assert requests.get(f"{s3_url}/bkt/k", headers={"If-Modified-Since": date}).status_code == 200
+
+
+def test_condition_bad_dates_are_ignored(s3_url, versioned):
+    for header in ["If-Modified-Since", "If-Unmodified-Since"]:
+        assert requests.get(f"{s3_url}/bkt/k", headers={header: "yesterday"}).status_code == 200
+
+
+def test_conditions_with_range(s3, versioned):
+    tag, _, _, _ = versioned
+    r = s3.get_object(Bucket="bkt", Key="k", Range="bytes=2-4", IfMatch=tag)
+    assert (r["ResponseMetadata"]["HTTPStatusCode"], r["Body"].read()) == (206, b"234")
+    assert read_with(s3, "get_object", Range="bytes=2-4", IfMatch='"other"') == 412
+    # The conditions go before the range.
+    assert read_with(s3, "get_object", Range="bytes=20-", IfMatch='"other"') == 412
+    assert read_with(s3, "get_object", Range="bytes=20-", IfMatch=tag) == 416
+
+
+def test_download_file(s3, tmp_path):
+    # boto3's managed download reads ranges with If-Match.
+    data = os.urandom(20 * 1024 * 1024 + 7)
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.write_bytes(data)
+    s3.upload_file(str(src), "bkt", "k")
+    s3.download_file("bkt", "k", str(dst))
+    assert dst.read_bytes() == data
+
+
 # Checksums
 
 @pytest.mark.parametrize("alg", ["crc32", "crc32c", "crc64nvme", "sha1", "sha256"])
@@ -441,8 +535,6 @@ def test_error_reply(s3_url, s3):
     ("POST", "/bkt/k?uploads", {"x-amz-checksum-algorithm": "CRC32", "x-amz-checksum-type": "FULL_OBJECT"}),
     ("PUT", "/bkt/k?partNumber=1&uploadId=x", {"x-amz-copy-source": "/bkt/src"}),
     ("GET", "/bkt?uploads", {}),
-    ("GET", "/bkt/k", {"If-None-Match": '"x"'}),
-    ("GET", "/bkt/k", {"If-Modified-Since": "Wed, 12 Oct 2009 17:50:00 GMT"}),
     ("GET", "/bkt/k?versionId=1", {}),
     ("GET", "/bkt?versioning", {}),
     ("POST", "/bkt?delete", {}),
