@@ -254,27 +254,13 @@ def test_copy_range_of_empty_object(plywood):
     expect_error("invalid_range", 416, plywood.copy, "bkt", "dst", "src", range="bytes=0-0")
 
 
-def test_copy_parts(plywood):
+def test_copy_part_open_ranges(plywood):
     plywood.put("bkt", "src", b"0123456789")
     s = plywood.open_session("bkt", "dst")
     assert plywood.copy_part("bkt", "dst", s, 1, "src", range="bytes=5-") == {"number": 1, "size": 5, "checksums": {}}
-    plywood.put_part("bkt", "dst", s, 2, b"-")
-    plywood.copy_part("bkt", "dst", s, 3, "src", range="bytes=0-4")
-    plywood.copy_part("bkt", "dst", s, 4, "src")
-    plywood.copy_part("bkt", "dst", s, 4, "src", range="bytes=0-0")  # replaces part 4
-    assert [p["size"] for p in plywood.describe_session("bkt", "dst", s)["parts"]] == [5, 1, 5, 1]
-    plywood.put("bkt", "src", b"changed")
-    plywood.commit("bkt", "dst", s, [1, 2, 3])
-    assert plywood.read("bkt", "dst") == b"56789-01234"
-
-
-def test_copy_part_dropped_on_abort(plywood, tmp_path):
-    plywood.put("bkt", "src", b"payload")
-    s = plywood.open_session("bkt", "dst")
-    plywood.copy_part("bkt", "dst", s, 1, "src")
-    plywood.abort("bkt", "dst", s)
-    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
-    assert links == [1]
+    plywood.copy_part("bkt", "dst", s, 2, "src", range="bytes=-3")
+    plywood.commit("bkt", "dst", s, [1, 2])
+    assert plywood.read("bkt", "dst") == b"56789789"
 
 
 def test_copy_preconditions(plywood):
@@ -287,12 +273,6 @@ def test_copy_preconditions(plywood):
     expect_error("precondition_failed", 412, plywood.copy_part, "bkt", "dst", s, 1, "src",
                  src_generation_match=src["generation"] + 1)
     assert plywood.describe_session("bkt", "dst", s)["parts"] == []
-
-
-def test_copy_part_missing_source(plywood):
-    s = plywood.open_session("bkt", "dst")
-    expect_error("no_such_key", 404, plywood.copy_part, "bkt", "dst", s, 1, "nope")
-    expect_error("invalid_argument", 400, plywood.copy, "bkt", "dst", "")
 
 
 @pytest.mark.parametrize("params", [

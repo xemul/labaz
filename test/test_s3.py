@@ -523,6 +523,66 @@ def test_copy_bad_source(s3_url, s3, source, code):
     assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, code)
 
 
+# UploadPartCopy
+
+def part_copy(s3, u: str, number: int, src: str, **kwargs) -> dict:
+    return s3.upload_part_copy(Bucket="bkt", Key="dst", UploadId=u, PartNumber=number,
+                               CopySource={"Bucket": "bkt", "Key": src}, **kwargs)["CopyPartResult"]
+
+
+def test_upload_part_copy(s3):
+    """A copied part's ETag is the MD5 of its data and its checksum of the
+    upload's algorithm, also when copied from a multipart source."""
+    parts = [os.urandom(PART_SIZE), b"tail"]
+    data = b"".join(parts)
+    u, listed = upload(s3, "src", parts)
+    complete(s3, "src", u, listed)
+    u = s3.create_multipart_upload(Bucket="bkt", Key="dst", ChecksumAlgorithm="SHA256")["UploadId"]
+    before = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    r1 = part_copy(s3, u, 1, "src")
+    assert (r1["ETag"], r1["ChecksumSHA256"]) == (md5_etag(data), b64(digest("sha256", data)))
+    assert r1["LastModified"] >= before
+    r2 = part_copy(s3, u, 2, "src", CopySourceRange="bytes=1-3")
+    assert (r2["ETag"], r2["ChecksumSHA256"]) == (md5_etag(data[1:4]), b64(digest("sha256", data[1:4])))
+    r = complete(s3, "dst", u, [{"PartNumber": 1, "ETag": r1["ETag"]}, {"PartNumber": 2, "ETag": r2["ETag"]}])
+    assert (r["ETag"], r["ChecksumSHA256"]) == (multipart_etag([data, data[1:4]]), composite("sha256", [data, data[1:4]]))
+    assert s3.get_object(Bucket="bkt", Key="dst")["Body"].read() == data + data[1:4]
+
+
+@pytest.mark.parametrize("range, message", [
+    ("bytes=2-", "must be of the form"),
+    ("bytes=-3", "must be of the form"),
+    ("bytes=4-2", "must be of the form"),
+    ("bytes=x-y", "must be of the form"),
+    ("bytes=0-0,2-3", "must be of the form"),
+    ("0-3", "must be of the form"),
+    ("bytes=5-20", "of size: 10"),
+    ("bytes=10-12", "of size: 10"),
+])
+def test_upload_part_copy_bad_range(s3, range, message):
+    s3.put_object(Bucket="bkt", Key="src", Body=b"0123456789")
+    u = s3.create_multipart_upload(Bucket="bkt", Key="dst")["UploadId"]
+    with pytest.raises(botocore.exceptions.ClientError) as e:
+        part_copy(s3, u, 1, "src", CopySourceRange=range)
+    assert (e.value.response["Error"]["Code"], e.value.response["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidArgument", 400)
+    assert message in e.value.response["Error"]["Message"]
+    assert s3.list_parts(Bucket="bkt", Key="dst", UploadId=u).get("Parts", []) == []
+
+
+def test_upload_part_copy_conditions(s3):
+    etag = s3.put_object(Bucket="bkt", Key="src", Body=b"x")["ETag"]
+    u = s3.create_multipart_upload(Bucket="bkt", Key="dst")["UploadId"]
+    expect_error("PreconditionFailed", 412, part_copy, s3, u, 1, "src", CopySourceIfMatch='"other"')
+    expect_error("PreconditionFailed", 412, part_copy, s3, u, 1, "src", CopySourceIfNoneMatch=etag)
+    assert s3.list_parts(Bucket="bkt", Key="dst", UploadId=u).get("Parts", []) == []
+    part_copy(s3, u, 1, "src", CopySourceIfMatch=etag)
+    assert [p["Size"] for p in s3.list_parts(Bucket="bkt", Key="dst", UploadId=u)["Parts"]] == [1]
+
+
+def test_upload_part_copy_bad_upload(s3):
+    expect_error("NoSuchUpload", 404, part_copy, s3, "nope", 1, "nope")
+
+
 # Listing
 
 @pytest.fixture
@@ -655,7 +715,7 @@ def test_error_reply(s3_url, s3):
     ("PUT", "/bkt/k", {"Content-Encoding": "aws-chunked"}),
     ("POST", "/bkt/k?uploads", {"x-amz-tagging": "a=b"}),
     ("POST", "/bkt/k?uploads", {"x-amz-checksum-algorithm": "CRC32", "x-amz-checksum-type": "FULL_OBJECT"}),
-    ("PUT", "/bkt/k?partNumber=1&uploadId=x", {"x-amz-copy-source": "/bkt/src"}),
+    ("PUT", "/bkt/k?partNumber=1&uploadId=x", {"x-amz-copy-source": "/bkt2/k"}),
     ("GET", "/bkt?uploads", {}),
     ("GET", "/bkt/k?versionId=1", {}),
     ("GET", "/bkt?versioning", {}),

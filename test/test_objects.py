@@ -395,6 +395,33 @@ def test_copy_must_not_exist(client):
 def test_copy_missing_source(client):
     expect_error(client, "no_such_key", client.copy, "bkt", "dst", "nope")
     expect_error(client, "no_such_key", client.read, "bkt", "dst")
+    u = client.open_upload("bkt", "dst")
+    expect_error(client, "no_such_key", client.copy_part, "bkt", "dst", u, 1, "nope")
+    assert client.list_parts("bkt", "dst", u) == []
+    expect_error(client, "invalid_argument", client.copy, "bkt", "dst", "")
+
+
+def test_copy_parts(client):
+    data = os.urandom(PART_SIZE) + b"tail"
+    client.put("bkt", "src", data)
+    u = client.open_upload("bkt", "dst")
+    client.copy_part("bkt", "dst", u, 1, "src", range=f"bytes=0-{PART_SIZE - 1}")
+    client.upload_part("bkt", "dst", u, 2, BIG)
+    client.copy_part("bkt", "dst", u, 3, "src")
+    client.copy_part("bkt", "dst", u, 3, "src", range=f"bytes={PART_SIZE}-{PART_SIZE + 3}")  # replaces part 3
+    assert client.list_parts("bkt", "dst", u) == [(1, PART_SIZE), (2, PART_SIZE), (3, 4)]
+    client.put("bkt", "src", b"changed")
+    client.complete("bkt", "dst", u, [1, 2, 3])
+    assert client.read("bkt", "dst") == data[:PART_SIZE] + BIG + b"tail"
+
+
+def test_copy_part_dropped_on_abort(client, tmp_path):
+    client.put("bkt", "src", b"payload")
+    u = client.open_upload("bkt", "dst")
+    client.copy_part("bkt", "dst", u, 1, "src")
+    client.abort("bkt", "dst", u)
+    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
+    assert links == [1]
 
 
 def test_copy_odd_keys(client):

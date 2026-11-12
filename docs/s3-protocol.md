@@ -104,6 +104,7 @@ supported and are refused with `InvalidArgument`.
 |---|---|---|
 | CreateMultipartUpload | `POST /{bucket}/{key}?uploads` | `x-amz-meta-*`, `x-amz-checksum-algorithm`, `x-amz-checksum-type` (below) |
 | UploadPart | `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}` | part numbers 1 to 10000; checksums as for PutObject; the reply's `ETag` is the part's MD5 |
+| UploadPartCopy | UploadPart's request with `x-amz-copy-source` | see below |
 | CompleteMultipartUpload | `POST /{bucket}/{key}?uploadId={id}` | `If-None-Match: *`, `x-amz-mp-object-size`, `x-amz-checksum-<algorithm>` of the whole object |
 | AbortMultipartUpload | `DELETE /{bucket}/{key}?uploadId={id}` | 204 |
 | ListParts | `GET /{bucket}/{key}?uploadId={id}` | `max-parts`, `part-number-marker`; a part's `LastModified` is the epoch: the storage does not keep it |
@@ -113,6 +114,14 @@ rules: the parts are listed in ascending order (`InvalidPartOrder`), exist
 with the listed ETags and checksums (`InvalidPart`), and all but the last
 have at least 5 MiB (`EntityTooSmall`). Parts uploaded but not listed are
 dropped. Completing a completed upload again gives the same reply.
+
+UploadPartCopy makes a part of an object of the same bucket, as CopyObject
+copies one (the source, its conditions, another bucket or version), or of
+`x-amz-copy-source-range: bytes=first-last` of it. Both offsets are
+required, and a range that is not within the source fails with
+`InvalidArgument`. The part has the checksums of its upload. The reply is a
+`CopyPartResult` with the part's `ETag` (its MD5), `LastModified` (the time
+of the copy) and its checksum of the upload's algorithm.
 
 ## Checksums
 
@@ -151,7 +160,7 @@ in byte order. Entries have `Key`, `LastModified`, `ETag`, `Size`,
 ## Not supported yet
 
 - Authentication (SigV4) and aws-chunked request bodies.
-- UploadPartCopy, and copying from another bucket.
+- Copying from another bucket.
 - ListMultipartUploads: the storage does not list sessions.
 - Object tagging.
 - DeleteObjects, versioning and every other bucket sub-resource.

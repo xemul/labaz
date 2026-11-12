@@ -117,6 +117,10 @@ class PlywoodFacade:
     def upload_part(self, bucket, key, upload: str, number: int, data: bytes):
         self.c.put_part(bucket, key, upload, number, data)
 
+    def copy_part(self, bucket, key, upload: str, number: int, src_key, range: str | None = None):
+        """range: "bytes=first-last" of the source."""
+        self.c.copy_part(bucket, key, upload, number, src_key, range=range)
+
     def list_parts(self, bucket, key, upload: str) -> list[tuple[int, int]]:
         """[(number, size)]"""
         return [(p["number"], p["size"]) for p in self.c.describe_session(bucket, key, upload)["parts"]]
@@ -229,6 +233,12 @@ class S3Facade:
     def upload_part(self, bucket, key, upload: str, number: int, data: bytes):
         r = self._call("upload_part", Bucket=bucket, Key=key, UploadId=upload, PartNumber=number, Body=data)
         self.etags[(upload, number)] = r["ETag"]
+
+    def copy_part(self, bucket, key, upload: str, number: int, src_key, range: str | None = None):
+        kwargs = {"CopySourceRange": range} if range else {}
+        r = self._call("upload_part_copy", Bucket=bucket, Key=key, UploadId=upload, PartNumber=number,
+                       CopySource={"Bucket": bucket, "Key": src_key}, **kwargs)
+        self.etags[(upload, number)] = r["CopyPartResult"]["ETag"]
 
     def list_parts(self, bucket, key, upload: str) -> list[tuple[int, int]]:
         r = self._call("list_parts", Bucket=bucket, Key=key, UploadId=upload)

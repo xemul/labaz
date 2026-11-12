@@ -367,6 +367,33 @@ static object_name copy_source(const request& req) {
     return object_name{sstring(path.substr(0, slash)), sstring(path.substr(slash + 1))};
 }
 
+// The range of x-amz-copy-source-range, which must be "bytes=first-last".
+static std::optional<byte_range> copy_source_range(const request& req) {
+    if (!req._headers.contains("x-amz-copy-source-range")) {
+        return std::nullopt;
+    }
+    auto header = req.get_header("x-amz-copy-source-range");
+    std::string_view s = header;
+    auto invalid = [] {
+        return invalid_argument("The x-amz-copy-source-range value must be of the form bytes=first-last "
+                                "where first and last are the zero-based offsets of the first and last bytes to copy");
+    };
+    if (!s.starts_with("bytes=")) {
+        throw invalid();
+    }
+    s.remove_prefix(6);
+    auto dash = s.find('-');
+    if (dash == std::string_view::npos) {
+        throw invalid();
+    }
+    auto first = parse_number<uint64_t>(s.substr(0, dash));
+    auto last = parse_number<uint64_t>(s.substr(dash + 1));
+    if (!first || !last || *first > *last) {
+        throw invalid();
+    }
+    return byte_range{first, last};
+}
+
 // S3's rules for names of new buckets.
 static void validate_bucket_name(std::string_view b) {
     auto invalid = [] {
@@ -1306,6 +1333,17 @@ private:
         co_return empty_reply(std::move(rep), status::ok);
     }
 
+    // The version of a copy's source to copy, which the
+    // x-amz-copy-source-if-* conditions hold for.
+    future<object_info> copy_source_info(const request& req, const sstring& bucket, const sstring& key) {
+        auto info = co_await _storage.head_object(bucket, key);
+        // Unlike a read's, all the conditions fail the copy alike.
+        if (check_conditions(req, info, "x-amz-copy-source-")) {
+            throw storage_error(errc::precondition_failed, "");
+        }
+        co_return info;
+    }
+
     // A copy is a new single upload of the source's data, whose checksums
     // the storage derives from the source's parts where it can, and
     // computes from the data otherwise. So its ETag is the MD5 of its data,
@@ -1334,11 +1372,7 @@ private:
 
         object_info info;
         for (;;) {
-            auto src_info = co_await _storage.head_object(bucket, src.key);
-            // All the conditions on the source fail the copy alike.
-            if (check_conditions(req, src_info, "x-amz-copy-source-")) {
-                throw storage_error(errc::precondition_failed, "");
-            }
+            auto src_info = co_await copy_source_info(req, bucket, src.key);
             object_attrs attrs;
             attrs.metadata = replace ? metadata_from_headers(req) : src_info.attrs.metadata;
             attrs.checksums = default_checksums;
@@ -1436,7 +1470,9 @@ private:
         if (!req.has_query_param("uploadId") || !req.has_query_param("partNumber")) {
             throw invalid_request("Uploading a part requires both partNumber and uploadId");
         }
-        reject_headers(req, {"x-amz-copy-source"});
+        if (req._headers.contains("x-amz-copy-source")) {
+            co_return co_await upload_part_copy(req, std::move(rep));
+        }
         check_plain_body(req);
         auto number = part_number(req.get_query_param("partNumber"));
         auto bucket = bucket_param(req);
@@ -1475,6 +1511,52 @@ private:
             }
         }
         co_return empty_reply(std::move(rep), status::ok);
+    }
+
+    // UploadPartCopy: the source's data (or the range of it) becomes the
+    // part, with the checksums of its upload, as for CopyObject.
+    future<std::unique_ptr<reply>> upload_part_copy(request& req, std::unique_ptr<reply> rep) {
+        auto number = part_number(req.get_query_param("partNumber"));
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto id = req.get_query_param("uploadId");
+        auto src = copy_source(req);
+        if (src.bucket != bucket) {
+            throw not_implemented("Copying from another bucket");
+        }
+        auto range = copy_source_range(req);
+        auto session = co_await _storage.describe_session(bucket, key, id);
+        auto alg = upload_algorithm(session.attrs.checksums);
+
+        part_info p;
+        for (;;) {
+            auto src_info = co_await copy_source_info(req, bucket, src.key);
+            if (range && *range->last >= src_info.size) {
+                throw invalid_argument(fmt::format("Range specified is not valid for source object of size: {}",
+                                                   src_info.size));
+            }
+            auto f = co_await coroutine::as_future(_storage.copy_part(bucket, key, id, number, src.key, range,
+                                                                      precondition{src_info.generation}));
+            if (!f.failed()) {
+                p = f.get();
+                break;
+            }
+            // The source changed after its conditions were checked: check
+            // them against its new version.
+            auto ex = f.get_exception();
+            if (!is_storage_error(ex, errc::precondition_failed)) {
+                std::rethrow_exception(ex);
+            }
+        }
+
+        xml_writer w;
+        w.root("CopyPartResult");
+        w.element("ETag", etag(p)).element("LastModified", iso8601_date(clock_type::now()));
+        if (auto it = p.checksums.find(alg); it != p.checksums.end()) {
+            w.element(fmt::format("Checksum{}", algorithm_name(alg)), to_base64(it->second));
+        }
+        w.close("CopyPartResult");
+        co_return xml_reply(std::move(rep), w);
     }
 
     future<std::unique_ptr<reply>> complete_multipart_upload(request& req, std::unique_ptr<reply> rep) {
