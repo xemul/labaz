@@ -148,7 +148,10 @@ class storage_service;
 /// The storage. There is one instance per shard, and every object belongs
 /// to one shard (see sharder): the calls about an object, and about its
 /// upload sessions, are run on that shard, whatever shard they are made on.
-/// Bucket calls and listing run on the shard they are made on.
+/// Bucket calls and listing run on the shard they are made on, and the
+/// backend answers them for all shards: a backend whose shards do not share
+/// their data spreads them over the shards itself (with owner_of() and
+/// invoke_on()), and merges the listings.
 ///
 /// The public calls do that routing and are the same for every backend.
 /// Backends implement the do_*() calls, each of which is only made on the

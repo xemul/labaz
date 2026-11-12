@@ -74,11 +74,6 @@ checksums object_checksums(const object_info& info) {
 
 using namespace seastar;
 
-// FIXME: bucket calls and listing run on the shard they are made on. That
-// is enough for a backend whose shards share all the data (potato), but one
-// keeping data per shard needs them fanned out to all shards (and listings
-// merged).
-
 future<> storage::create_bucket(sstring bucket) {
     return do_create_bucket(std::move(bucket));
 }

@@ -393,6 +393,8 @@ public:
     future<> do_create_bucket(sstring bucket) override {
         validate_bucket_name(bucket);
         auto dir = bucket_dir(bucket);
+        // FIXME: two shards creating the bucket at once can both pass the
+        // check, and the one that loses fails with EEXIST, not bucket_exists.
         if (co_await file_exists(dir.native())) {
             fail(errc::bucket_exists, fmt::format("bucket '{}' exists", bucket));
         }
@@ -401,6 +403,11 @@ public:
 
     future<> do_delete_bucket(sstring bucket) override {
         validate_bucket_name(bucket);
+        // FIXME: nothing excludes object calls on other shards, whose locks
+        // are their own. A session opened there between the emptiness check
+        // and the removal either loses its directory or fails the removal,
+        // and listing a bucket being removed can fail; such races end with
+        // errors, not with lost objects.
         co_await check_bucket(bucket);
         if (co_await has_objects(bucket_dir(bucket))) {
             fail(errc::bucket_not_empty, fmt::format("bucket '{}' is not empty", bucket));
