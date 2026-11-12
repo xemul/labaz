@@ -20,6 +20,7 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/matchrules.hh>
+#include <seastar/http/url.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/short_streams.hh>
 
@@ -314,6 +315,12 @@ static sstring bucket_param(const request& req) {
     return req.get_path_param("bucket");
 }
 
+static void check_key_length(std::string_view key) {
+    if (key.size() > max_key_length) {
+        throw s3_error(status::bad_request, "KeyTooLongError", "Your key is too long");
+    }
+}
+
 static sstring key_param(const request& req) {
     // The routes drop a trailing '/' from the path, but keys ending with
     // '/' are not supported, so refuse them rather than use another key.
@@ -321,10 +328,43 @@ static sstring key_param(const request& req) {
         throw invalid_argument("Keys ending with '/' are not supported");
     }
     auto key = req.get_path_param("key");
-    if (key.size() > max_key_length) {
-        throw s3_error(status::bad_request, "KeyTooLongError", "Your key is too long");
-    }
+    check_key_length(key);
     return key;
+}
+
+struct object_name {
+    sstring bucket;
+    sstring key;
+};
+
+// The source of a copy, from x-amz-copy-source: "[/]bucket/key", URL-encoded,
+// which may be followed by "?versionId=...".
+static object_name copy_source(const request& req) {
+    auto header = req.get_header("x-amz-copy-source");
+    std::string_view s = header;
+    if (auto q = s.find('?'); q != std::string_view::npos) {
+        if (s.substr(q + 1).starts_with("versionId=")) {
+            throw not_implemented("Copying a version of an object");
+        }
+        s = s.substr(0, q);
+    }
+    sstring decoded;
+    if (!http::internal::path_decode(s, decoded)) {
+        throw invalid_argument("Invalid copy source encoding");
+    }
+    std::string_view path = decoded;
+    if (path.starts_with('/')) {
+        path.remove_prefix(1);
+    }
+    auto slash = path.find('/');
+    if (slash == 0 || slash == std::string_view::npos || slash + 1 == path.size()) {
+        throw invalid_argument("Copy Source must mention the source bucket and key: sourcebucket/sourcekey");
+    }
+    if (path.ends_with('/')) {
+        throw invalid_argument("Keys ending with '/' are not supported");
+    }
+    check_key_length(path.substr(slash + 1));
+    return object_name{sstring(path.substr(0, slash)), sstring(path.substr(slash + 1))};
 }
 
 // S3's rules for names of new buckets.
@@ -418,6 +458,19 @@ struct upload_checksums {
     checksums expected;
     std::set<checksum_algorithm> algorithms;
 };
+
+// The algorithm x-amz-checksum-algorithm asks for, if any.
+static std::optional<checksum_algorithm> requested_algorithm(const request& req) {
+    auto name = req.get_header("x-amz-checksum-algorithm");
+    if (name.empty()) {
+        return std::nullopt;
+    }
+    auto alg = s3_checksum_algorithm(name);
+    if (!alg) {
+        throw invalid_request(fmt::format("Unsupported checksum algorithm '{}'", name));
+    }
+    return alg;
+}
 
 static upload_checksums upload_checksums_from_headers(const request& req) {
     upload_checksums ret;
@@ -730,25 +783,28 @@ static bool etag_listed(std::string_view header, std::string_view tag, bool weak
 // Evaluates the conditional headers of GetObject and HeadObject against
 // the version of the object read, in the order HTTP does, and returns the
 // status to reply with instead of the object, if any: 412 or 304. A date
-// that does not parse makes its header ignored.
-static std::optional<status> check_conditions(const request& req, const object_info& info) {
+// that does not parse makes its header ignored. CopyObject's conditions on
+// its source are the same headers with the x-amz-copy-source- prefix.
+static std::optional<status> check_conditions(const request& req, const object_info& info,
+                                              std::string_view prefix = "") {
+    auto header = [&] (std::string_view name) { return sstring(fmt::format("{}{}", prefix, name)); };
     auto tag = etag(info);
     // As Last-Modified reports it.
     auto modified = std::chrono::time_point_cast<std::chrono::seconds>(info.mtime);
-    if (req._headers.contains("If-Match")) {
-        if (!etag_listed(req.get_header("If-Match"), tag, false)) {
+    if (req._headers.contains(header("If-Match"))) {
+        if (!etag_listed(req.get_header(header("If-Match")), tag, false)) {
             return static_cast<status>(412);
         }
-    } else if (auto date = parse_http_date(req.get_header("If-Unmodified-Since"))) {
+    } else if (auto date = parse_http_date(req.get_header(header("If-Unmodified-Since")))) {
         if (modified > *date) {
             return static_cast<status>(412);
         }
     }
-    if (req._headers.contains("If-None-Match")) {
-        if (etag_listed(req.get_header("If-None-Match"), tag, true)) {
+    if (req._headers.contains(header("If-None-Match"))) {
+        if (etag_listed(req.get_header(header("If-None-Match")), tag, true)) {
             return status::not_modified;
         }
-    } else if (auto date = parse_http_date(req.get_header("If-Modified-Since"))) {
+    } else if (auto date = parse_http_date(req.get_header(header("If-Modified-Since")))) {
         if (modified <= *date) {
             return status::not_modified;
         }
@@ -1136,6 +1192,9 @@ private:
         if (req.has_query_param("uploadId") || req.has_query_param("partNumber")) {
             return upload_part(req, std::move(rep));
         }
+        if (req._headers.contains("x-amz-copy-source")) {
+            return copy_object(req, std::move(rep));
+        }
         return put_whole_object(req, std::move(rep));
     }
 
@@ -1208,7 +1267,7 @@ private:
 
     future<std::unique_ptr<reply>> put_whole_object(request& req, std::unique_ptr<reply> rep) {
         reject_query_params(req, {"acl", "legal-hold", "retention", "tagging"});
-        reject_headers(req, {"x-amz-copy-source", "x-amz-tagging"});
+        reject_headers(req, {"x-amz-tagging"});
         check_plain_body(req);
         auto pre = write_precondition(req);
         auto sums = upload_checksums_from_headers(req);
@@ -1247,6 +1306,78 @@ private:
         co_return empty_reply(std::move(rep), status::ok);
     }
 
+    // A copy is a new single upload of the source's data, whose checksums
+    // the storage derives from the source's parts where it can, and
+    // computes from the data otherwise. So its ETag is the MD5 of its data,
+    // even when the source's is a multipart one.
+    future<std::unique_ptr<reply>> copy_object(request& req, std::unique_ptr<reply> rep) {
+        reject_query_params(req, {"acl", "legal-hold", "retention", "tagging"});
+        reject_headers(req, {"x-amz-tagging"});
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto src = copy_source(req);
+        if (src.bucket != bucket) {
+            throw not_implemented("Copying from another bucket");
+        }
+        auto pre = write_precondition(req);
+        auto directive = req.get_header("x-amz-metadata-directive");
+        if (!directive.empty() && directive != "COPY" && directive != "REPLACE") {
+            throw invalid_argument("Unknown metadata directive.");
+        }
+        bool replace = directive == "REPLACE";
+        if (src.key == key && !replace) {
+            throw invalid_request("This copy request is illegal because it is trying to copy an object to itself "
+                                  "without changing the object's metadata, storage class, website redirect location "
+                                  "or encryption attributes.");
+        }
+        auto alg = requested_algorithm(req);
+
+        object_info info;
+        for (;;) {
+            auto src_info = co_await _storage.head_object(bucket, src.key);
+            // All the conditions on the source fail the copy alike.
+            if (check_conditions(req, src_info, "x-amz-copy-source-")) {
+                throw storage_error(errc::precondition_failed, "");
+            }
+            object_attrs attrs;
+            attrs.metadata = replace ? metadata_from_headers(req) : src_info.attrs.metadata;
+            attrs.checksums = default_checksums;
+            attrs.checksums.insert(alg.value_or(upload_algorithm(src_info.attrs.checksums)));
+
+            auto id = co_await _storage.open_session(bucket, key, std::move(attrs));
+            bool copied = false;
+            std::exception_ptr ex;
+            try {
+                co_await _storage.copy_part(bucket, key, id, 1, src.key, std::nullopt,
+                                            precondition{src_info.generation});
+                copied = true;
+                info = co_await _storage.commit_session(bucket, key, id, {1}, pre, upload_kind::single);
+            } catch (...) {
+                ex = std::current_exception();
+            }
+            if (!ex) {
+                break;
+            }
+            // Report the original error, not a failure to clean up after it.
+            auto f = co_await coroutine::as_future(_storage.abort_session(bucket, key, id));
+            f.ignore_ready_future();
+            // The source changed after its conditions were checked: check
+            // them against its new version.
+            if (copied || !is_storage_error(ex, errc::precondition_failed)) {
+                std::rethrow_exception(ex);
+            }
+        }
+
+        xml_writer w;
+        w.root("CopyObjectResult");
+        w.element("ETag", etag(info)).element("LastModified", iso8601_date(info.mtime));
+        if (auto c = object_checksum(info)) {
+            write_checksum(w, *c);
+        }
+        w.close("CopyObjectResult");
+        co_return xml_reply(std::move(rep), w);
+    }
+
     future<std::unique_ptr<reply>> delete_whole_object(request& req, std::unique_ptr<reply> rep) {
         reject_query_params(req, {"tagging", "versionId"});
         try {
@@ -1267,12 +1398,8 @@ private:
         object_attrs attrs;
         attrs.metadata = metadata_from_headers(req);
         attrs.checksums = default_checksums;
-        std::optional<checksum_algorithm> alg;
-        if (auto name = req.get_header("x-amz-checksum-algorithm"); !name.empty()) {
-            alg = s3_checksum_algorithm(name);
-            if (!alg) {
-                throw invalid_request(fmt::format("Unsupported checksum algorithm '{}'", name));
-            }
+        auto alg = requested_algorithm(req);
+        if (alg) {
             attrs.checksums.insert(*alg);
         }
         if (auto type = req.get_header("x-amz-checksum-type"); !type.empty()) {

@@ -52,6 +52,7 @@ Every reply has an `x-amz-request-id` header. Replies to `HEAD` have no body.
 | GetObject | `GET /{bucket}/{key}` | a single `Range: bytes=...`; an unparsable `Range` is ignored, as S3 does; conditions (below) |
 | HeadObject | `HEAD /{bucket}/{key}` | the same headers as GetObject, `Range` and conditions included |
 | DeleteObject | `DELETE /{bucket}/{key}` | 204, also if the key does not exist |
+| CopyObject | `PUT /{bucket}/{key}` with `x-amz-copy-source` | see below |
 
 GetObject and HeadObject reply with `Content-Length`, `ETag`, `Last-Modified`,
 `Accept-Ranges: bytes`, `Content-Type: binary/octet-stream` and the
@@ -71,6 +72,28 @@ object's `ETag` and `Last-Modified`. Entity tags may be listed, `*`, weak
 (`W/`, which never matches `If-Match`) or unquoted; dates are HTTP dates in
 any of HTTP's three formats, compared at the one-second resolution of
 `Last-Modified`, and a date that does not parse is ignored.
+
+CopyObject copies an object of the same bucket; a source in another bucket,
+or a `versionId` of it, fails with `NotImplemented`. `x-amz-copy-source` is
+`[/]bucket/key`, URL-encoded.
+
+- `x-amz-metadata-directive`: `COPY` (the default) keeps the source's
+  `x-amz-meta-*`, ignoring the request's; `REPLACE` takes the request's.
+  Copying an object onto itself requires `REPLACE` (`InvalidRequest`).
+- The copy is a new single upload, so its `ETag` is the MD5 of its data,
+  also when the source's is a multipart one. Its checksum is of the
+  `x-amz-checksum-algorithm` asked for or else the source's algorithm, and
+  is `FULL_OBJECT`. The storage derives what checksums it can from the
+  source's parts and reads the data for the others, so copying a multipart
+  source reads it once, for its MD5.
+- `x-amz-copy-source-if-match`, `-if-none-match`, `-if-modified-since` and
+  `-if-unmodified-since` are evaluated against the source as GetObject's
+  conditions are, but any of them failing gives `412 PreconditionFailed`.
+  If the source changes after they were checked, they are checked again
+  against its new version.
+- `If-None-Match: *` applies to the destination.
+- The reply is a `CopyObjectResult` with `ETag`, `LastModified` and the
+  checksum.
 
 Keys are up to 1024 bytes (`KeyTooLongError`). Keys ending with `/` are not
 supported and are refused with `InvalidArgument`.
@@ -128,7 +151,7 @@ in byte order. Entries have `Key`, `LastModified`, `ETag`, `Size`,
 ## Not supported yet
 
 - Authentication (SigV4) and aws-chunked request bodies.
-- CopyObject and UploadPartCopy.
+- UploadPartCopy, and copying from another bucket.
 - ListMultipartUploads: the storage does not list sessions.
 - Object tagging.
 - DeleteObjects, versioning and every other bucket sub-resource.

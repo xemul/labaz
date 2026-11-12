@@ -222,32 +222,6 @@ def multipart(plywood, key, chunks):
     return plywood.commit("bkt", key, s)
 
 
-def test_copy_object(plywood):
-    src = plywood.put("bkt", "src", b"payload", metadata={"m": "src"})
-    info = plywood.copy("bkt", "dst", "src", metadata={"m": "dst"})
-    assert info["size"] == 7
-    assert info["generation"] != src["generation"]
-    assert plywood.read("bkt", "dst") == b"payload"
-    assert plywood.head("bkt", "dst").headers["X-Labaz-Meta-m"] == "dst"
-    assert plywood.read("bkt", "src") == b"payload"
-
-
-def test_copy_shares_files(plywood, tmp_path):
-    plywood.put("bkt", "src", b"payload")
-    plywood.copy("bkt", "dst", "src")
-    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
-    assert links == [2, 2]
-
-
-def test_copy_outlives_source(plywood):
-    multipart(plywood, "src", [b"01", b"23", b"45"])
-    plywood.copy("bkt", "dst", "src")
-    plywood.put("bkt", "src", b"new")
-    assert plywood.read("bkt", "dst") == b"012345"
-    plywood.delete("bkt", "src")
-    assert plywood.read("bkt", "dst") == b"012345"
-
-
 def test_copy_range(plywood):
     data = b"0123456789"
     multipart(plywood, "src", [b"0123", b"", b"45", b"6789"])
@@ -269,16 +243,14 @@ def test_copy_of_copy(plywood):
     assert plywood.read("bkt", "c", range="bytes=1-1") == b"4"
 
 
-def test_copy_onto_itself(plywood):
+def test_copy_range_onto_itself(plywood):
     plywood.put("bkt", "obj", b"0123456789")
     plywood.copy("bkt", "obj", "obj", range="bytes=2-4")
     assert plywood.read("bkt", "obj") == b"234"
 
 
-def test_copy_empty_object(plywood):
+def test_copy_range_of_empty_object(plywood):
     plywood.put("bkt", "src", b"")
-    assert plywood.copy("bkt", "dst", "src")["size"] == 0
-    assert plywood.read("bkt", "dst") == b""
     expect_error("invalid_range", 416, plywood.copy, "bkt", "dst", "src", range="bytes=0-0")
 
 
@@ -311,26 +283,16 @@ def test_copy_preconditions(plywood):
                  src_generation_match=src["generation"] + 1)
     expect_error("no_such_key", 404, plywood.read, "bkt", "dst")
     plywood.copy("bkt", "dst", "src", src_generation_match=src["generation"])
-    expect_error("precondition_failed", 412, plywood.copy, "bkt", "dst", "src", generation_match=0)
     s = plywood.open_session("bkt", "dst")
     expect_error("precondition_failed", 412, plywood.copy_part, "bkt", "dst", s, 1, "src",
                  src_generation_match=src["generation"] + 1)
     assert plywood.describe_session("bkt", "dst", s)["parts"] == []
 
 
-def test_copy_missing_source(plywood):
-    expect_error("no_such_key", 404, plywood.copy, "bkt", "dst", "nope")
-    expect_error("no_such_key", 404, plywood.read, "bkt", "dst")
+def test_copy_part_missing_source(plywood):
     s = plywood.open_session("bkt", "dst")
     expect_error("no_such_key", 404, plywood.copy_part, "bkt", "dst", s, 1, "nope")
     expect_error("invalid_argument", 400, plywood.copy, "bkt", "dst", "")
-
-
-def test_copy_odd_keys(plywood):
-    src = "a&b=c/%2F?#+ ü"
-    plywood.put("bkt", src, b"x")
-    plywood.copy("bkt", "dst", src)
-    assert plywood.read("bkt", "dst") == b"x"
 
 
 @pytest.mark.parametrize("params", [

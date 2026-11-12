@@ -403,6 +403,126 @@ def test_upload_file(s3, tmp_path):
     assert s3.get_object(Bucket="bkt", Key="k")["Body"].read() == data
 
 
+# CopyObject
+
+def copy(s3, key: str, src: str, **kwargs) -> dict:
+    return s3.copy_object(Bucket="bkt", Key=key, CopySource={"Bucket": "bkt", "Key": src}, **kwargs)
+
+
+def test_copy_etag(s3):
+    """A copy is a single upload: its ETag is the MD5 of its data, whatever
+    the source's is."""
+    parts = [os.urandom(PART_SIZE), b"tail"]
+    u, listed = upload(s3, "mp", parts)
+    complete(s3, "mp", u, listed)
+    r = copy(s3, "c1", "mp")["CopyObjectResult"]
+    assert r["ETag"] == md5_etag(b"".join(parts))
+    assert s3.head_object(Bucket="bkt", Key="c1")["ETag"] == md5_etag(b"".join(parts))
+    s3.put_object(Bucket="bkt", Key="single", Body=b"hello")
+    assert copy(s3, "c2", "single")["CopyObjectResult"]["ETag"] == md5_etag(b"hello")
+
+
+def test_copy_checksum(s3):
+    """A copy keeps the source's checksum algorithm, unless asked for
+    another one, as a FULL_OBJECT checksum."""
+    parts = [os.urandom(PART_SIZE), b"tail"]
+    data = b"".join(parts)
+    u, listed = upload(s3, "crc32", parts, ChecksumAlgorithm="CRC32")
+    complete(s3, "crc32", u, listed)
+    s3.put_object(Bucket="bkt", Key="sha256", Body=data, ChecksumAlgorithm="SHA256")
+    # Not put_object(), whose body boto3 sends with a CRC32.
+    u, listed = upload(s3, "default", parts)
+    complete(s3, "default", u, listed)
+    for src, kwargs, alg in [("crc32", {}, "crc32"), ("sha256", {}, "sha256"), ("default", {}, "crc64nvme"),
+                             ("crc32", {"ChecksumAlgorithm": "SHA1"}, "sha1"),
+                             ("default", {"ChecksumAlgorithm": "CRC32C"}, "crc32c")]:
+        arg = f"Checksum{alg.upper()}"
+        r = copy(s3, "dst", src, **kwargs)["CopyObjectResult"]
+        assert (r[arg], r["ChecksumType"]) == (b64(digest(alg, data)), "FULL_OBJECT")
+        h = s3.head_object(Bucket="bkt", Key="dst", ChecksumMode="ENABLED")
+        assert (h[arg], h["ChecksumType"]) == (b64(digest(alg, data)), "FULL_OBJECT")
+
+
+def test_copy_metadata_directive(s3):
+    s3.put_object(Bucket="bkt", Key="src", Body=b"x", Metadata={"m": "src"})
+    copy(s3, "dst", "src", Metadata={"m": "ignored"})
+    assert s3.head_object(Bucket="bkt", Key="dst")["Metadata"] == {"m": "src"}
+    copy(s3, "dst", "src", MetadataDirective="COPY")
+    assert s3.head_object(Bucket="bkt", Key="dst")["Metadata"] == {"m": "src"}
+    copy(s3, "dst", "src", MetadataDirective="REPLACE", Metadata={"n": "dst"})
+    assert s3.head_object(Bucket="bkt", Key="dst")["Metadata"] == {"n": "dst"}
+    copy(s3, "dst", "src", MetadataDirective="REPLACE")
+    assert s3.head_object(Bucket="bkt", Key="dst")["Metadata"] == {}
+    expect_error("InvalidArgument", 400, copy, s3, "dst", "src", MetadataDirective="MOVE")
+
+
+def test_copy_onto_itself_needs_replace(s3):
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x", Metadata={"m": "v"})
+    expect_error("InvalidRequest", 400, copy, s3, "k", "k")
+    expect_error("InvalidRequest", 400, copy, s3, "k", "k", ChecksumAlgorithm="SHA256")
+    copy(s3, "k", "k", MetadataDirective="REPLACE")
+    h = s3.head_object(Bucket="bkt", Key="k")
+    assert (h["Metadata"], s3.get_object(Bucket="bkt", Key="k")["Body"].read()) == ({}, b"x")
+
+
+@pytest.mark.parametrize("conditions, ok", [
+    ({"CopySourceIfMatch": "{etag}"}, True),
+    ({"CopySourceIfMatch": '"other"'}, False),
+    ({"CopySourceIfMatch": "*"}, True),
+    ({"CopySourceIfNoneMatch": "{etag}"}, False),
+    ({"CopySourceIfNoneMatch": '"other"'}, True),
+    ({"CopySourceIfModifiedSince": "{past}"}, True),
+    ({"CopySourceIfModifiedSince": "{future}"}, False),
+    ({"CopySourceIfUnmodifiedSince": "{future}"}, True),
+    ({"CopySourceIfUnmodifiedSince": "{past}"}, False),
+    # As HTTP evaluates them: If-Match wins over If-Unmodified-Since, and
+    # If-None-Match over If-Modified-Since.
+    ({"CopySourceIfMatch": "{etag}", "CopySourceIfUnmodifiedSince": "{past}"}, True),
+    ({"CopySourceIfNoneMatch": '"other"', "CopySourceIfModifiedSince": "{future}"}, True),
+    ({"CopySourceIfNoneMatch": "{etag}", "CopySourceIfModifiedSince": "{past}"}, False),
+])
+def test_copy_source_conditions(s3, conditions, ok):
+    etag = s3.put_object(Bucket="bkt", Key="src", Body=b"x")["ETag"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    values = {"{etag}": etag, "{past}": now - datetime.timedelta(days=1), "{future}": now + datetime.timedelta(days=1)}
+    kwargs = {k: values.get(v, v) for k, v in conditions.items()}
+    if ok:
+        copy(s3, "dst", "src", **kwargs)
+        assert s3.get_object(Bucket="bkt", Key="dst")["Body"].read() == b"x"
+    else:
+        # Whichever condition fails, unlike a read's 304.
+        expect_error("PreconditionFailed", 412, copy, s3, "dst", "src", **kwargs)
+        expect_error("NoSuchKey", 404, s3.get_object, Bucket="bkt", Key="dst")
+
+
+@pytest.mark.parametrize("source, key", [
+    ("/bkt/src", "src"),
+    ("bkt/src", "src"),
+    ("/bkt/a%20b%2Bc", "a b+c"),
+    ("/bkt/a+b", "a+b"),
+    ("/bkt/d/e", "d/e"),
+])
+def test_copy_source_header(s3_url, s3, source, key):
+    s3.put_object(Bucket="bkt", Key=key, Body=b"x")
+    r = requests.put(f"{s3_url}/bkt/dst", headers={"x-amz-copy-source": source})
+    assert r.status_code == 200, r.content
+    assert ET.fromstring(r.content).tag == f"{NS}CopyObjectResult"
+    assert s3.get_object(Bucket="bkt", Key="dst")["Body"].read() == b"x"
+
+
+@pytest.mark.parametrize("source, code", [
+    ("bkt", "InvalidArgument"),
+    ("/bkt/", "InvalidArgument"),
+    ("/bkt", "InvalidArgument"),
+    ("//src", "InvalidArgument"),
+    ("/bkt/dir/", "InvalidArgument"),
+    ("/bkt/" + "x" * 1025, "KeyTooLongError"),
+])
+def test_copy_bad_source(s3_url, s3, source, code):
+    r = requests.put(f"{s3_url}/bkt/dst", headers={"x-amz-copy-source": source})
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, code)
+
+
 # Listing
 
 @pytest.fixture
@@ -526,7 +646,9 @@ def test_error_reply(s3_url, s3):
     ("PUT", "/bkt/k?tagging", {}),
     ("GET", "/bkt/k?tagging", {}),
     ("PUT", "/bkt/k", {"x-amz-tagging": "a=b"}),
-    ("PUT", "/bkt/k", {"x-amz-copy-source": "/bkt/src"}),
+    ("PUT", "/bkt/k", {"x-amz-copy-source": "/bkt2/k"}),
+    ("PUT", "/bkt/k", {"x-amz-copy-source": "/bkt/k?versionId=1", "x-amz-metadata-directive": "REPLACE"}),
+    ("PUT", "/bkt/k", {"x-amz-copy-source": "/bkt/k", "x-amz-metadata-directive": "REPLACE", "x-amz-tagging": "a=b"}),
     ("PUT", "/bkt/k", {"If-Match": '"x"'}),
     ("PUT", "/bkt/k", {"If-None-Match": '"x"'}),
     ("PUT", "/bkt/k", {"x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"}),

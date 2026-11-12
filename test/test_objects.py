@@ -340,6 +340,70 @@ def test_range_across_parts(client):
         assert client.read("bkt", "obj", range=f"bytes={first}-{last}") == data[first:last + 1]
 
 
+# Copies
+
+def test_copy_object(client):
+    client.put("bkt", "src", b"payload", metadata={"m": "src"})
+    client.copy("bkt", "dst", "src", metadata={"m": "dst"})
+    o = client.get("bkt", "dst")
+    assert (o.data, o.metadata) == (b"payload", {"m": "dst"})
+    o = client.get("bkt", "src")
+    assert (o.data, o.metadata) == (b"payload", {"m": "src"})
+
+
+def test_copy_shares_files(client, tmp_path):
+    client.put("bkt", "src", b"payload")
+    client.copy("bkt", "dst", "src")
+    links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
+    assert links == [2, 2]
+
+
+def test_copy_outlives_source(client):
+    u = client.open_upload("bkt", "src")
+    client.upload_part("bkt", "src", u, 1, BIG)
+    client.upload_part("bkt", "src", u, 2, b"tail")
+    client.complete("bkt", "src", u, [1, 2])
+    client.copy("bkt", "dst", "src")
+    client.put("bkt", "src", b"new")
+    assert client.read("bkt", "dst") == BIG + b"tail"
+    client.delete("bkt", "src")
+    assert client.read("bkt", "dst") == BIG + b"tail"
+
+
+def test_copy_onto_itself(client):
+    client.put("bkt", "obj", b"payload", metadata={"m": "old"})
+    client.copy("bkt", "obj", "obj", metadata={"m": "new"})
+    o = client.get("bkt", "obj")
+    assert (o.data, o.metadata) == (b"payload", {"m": "new"})
+
+
+def test_copy_empty_object(client):
+    client.put("bkt", "src", b"")
+    client.copy("bkt", "dst", "src")
+    o = client.get("bkt", "dst")
+    assert (o.data, o.size) == (b"", 0)
+
+
+def test_copy_must_not_exist(client):
+    client.put("bkt", "src", b"payload")
+    client.copy("bkt", "dst", "src", must_not_exist=True)
+    client.put("bkt", "src", b"other")
+    expect_error(client, "precondition_failed", client.copy, "bkt", "dst", "src", must_not_exist=True)
+    assert client.read("bkt", "dst") == b"payload"
+
+
+def test_copy_missing_source(client):
+    expect_error(client, "no_such_key", client.copy, "bkt", "dst", "nope")
+    expect_error(client, "no_such_key", client.read, "bkt", "dst")
+
+
+def test_copy_odd_keys(client):
+    src = "a&b=c/%2F?#+ ü"
+    client.put("bkt", src, b"x")
+    client.copy("bkt", "dst", src)
+    assert client.read("bkt", "dst") == b"x"
+
+
 # Checksums
 
 def test_verify_object(client):

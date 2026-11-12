@@ -97,6 +97,10 @@ class PlywoodFacade:
     def delete(self, bucket, key):
         self.c.delete(bucket, key)
 
+    def copy(self, bucket, key, src_key, metadata: dict | None = None, must_not_exist: bool = False):
+        """Copies the whole source, with the given metadata."""
+        self.c.copy(bucket, key, src_key, metadata=metadata, generation_match=0 if must_not_exist else None)
+
     def list(self, bucket, prefix="", start_after="", max_keys=None) -> tuple[list[dict], bool]:
         """([{"key", "size"}], truncated)"""
         r = self.c.list(bucket, prefix=prefix, start_after=start_after, max_keys=max_keys)
@@ -194,6 +198,11 @@ class S3Facade:
 
     def delete(self, bucket, key):
         self._call("delete_object", Bucket=bucket, Key=key)
+
+    def copy(self, bucket, key, src_key, metadata: dict | None = None, must_not_exist: bool = False):
+        kwargs = {"IfNoneMatch": "*"} if must_not_exist else {}
+        self._call("copy_object", Bucket=bucket, Key=key, CopySource={"Bucket": bucket, "Key": src_key},
+                   MetadataDirective="REPLACE", Metadata=metadata or {}, **kwargs)
 
     def list(self, bucket, prefix="", start_after="", max_keys=None) -> tuple[list[dict], bool]:
         kwargs = {"Prefix": prefix, "StartAfter": start_after}
