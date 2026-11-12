@@ -17,7 +17,7 @@ understand and debug, so it trades everything else for that.
 Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
 
 ```
-<bucket>/<sha1(key)>/meta.json        object meta (JSON): the key, attributes, parts and slices
+<bucket>/<sha1(key)>/meta.json        object meta (JSON): the key, attributes, how it was uploaded, parts and slices
 <bucket>/<sha1(key)>/data.<gen>/      the object's parts
 <bucket>/<sha1(key)>/session.<id>/    an upload session's parts
 .staging/                             links of copies between shards

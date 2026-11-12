@@ -34,8 +34,10 @@ A request that matches no route gets Seastar's own 404 reply.
 ## Objects
 
 An object info is
-`{"key", "size", "generation", "mtime_ns", "metadata": {}, "checksums": {}, "parts": [part info]}`,
-and a part info is `{"number", "size", "checksums": {}}`.
+`{"key", "size", "generation", "multipart", "mtime_ns", "metadata": {}, "checksums": {}, "parts": [part info]}`,
+and a part info is `{"number", "size", "checksums": {}}`. `multipart` is false
+for an object made by a `PUT` (a copy included) and true for one committed
+from a session, whatever its number of parts.
 
 | Request | Reply |
 |---|---|

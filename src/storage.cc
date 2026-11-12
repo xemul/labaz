@@ -131,9 +131,9 @@ future<session_info> storage_service::describe_session(sstring bucket, sstring k
 }
 
 future<object_info> storage_service::commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
-                                                    precondition pre) {
-    return invoke_on(owner_of(bucket, key), [bucket, key, id, parts = std::move(parts), pre] (storage& s) {
-        return s.commit_session(bucket, key, id, parts, pre);
+                                                    precondition pre, upload_kind kind) {
+    return invoke_on(owner_of(bucket, key), [bucket, key, id, parts = std::move(parts), pre, kind] (storage& s) {
+        return s.commit_session(bucket, key, id, parts, pre, kind);
     });
 }
 

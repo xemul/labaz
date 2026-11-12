@@ -191,6 +191,7 @@ static sstring serialize(const object_meta& m) {
     w.Key("size"); w.Uint64(m.info.size);
     w.Key("mtime_ns"); w.Int64(std::chrono::duration_cast<std::chrono::nanoseconds>(m.info.mtime.time_since_epoch()).count());
     w.Key("generation"); w.Uint64(m.info.generation);
+    w.Key("multipart"); w.Bool(m.info.upload == upload_kind::multipart);
     w.Key("metadata");
     w.StartObject();
     for (auto& [k, v] : m.info.attrs.metadata) {
@@ -246,6 +247,7 @@ static object_meta deserialize(std::string_view s) {
     m.info.mtime = clock_type::time_point(std::chrono::duration_cast<clock_type::duration>(
             std::chrono::nanoseconds(d["mtime_ns"].GetInt64())));
     m.info.generation = d["generation"].GetUint64();
+    m.info.upload = d["multipart"].GetBool() ? upload_kind::multipart : upload_kind::single;
     auto algorithm = [] (std::string_view name) {
         auto alg = checksum_algorithm_from_string(name);
         if (!alg) {
@@ -525,7 +527,7 @@ public:
     }
 
     future<object_info> commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> numbers,
-                                       precondition pre) override {
+                                       precondition pre, upload_kind kind) override {
         auto it = _sessions.find(id);
         if (it != _sessions.end() && it->second.committed && it->second.bucket == bucket && it->second.key == key) {
             co_return *it->second.committed;
@@ -533,6 +535,7 @@ public:
         auto& st = active_session(bucket, key, id);
 
         object_meta m;
+        m.info.upload = kind;
         std::set<unsigned> listed;
         for (auto n : numbers) {
             auto p = st.parts.find(n);

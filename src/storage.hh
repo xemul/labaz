@@ -70,6 +70,13 @@ struct part_info {
     labaz::checksums checksums;
 };
 
+/// How an object was uploaded, as the facade that committed it says. Some
+/// protocols tell the two apart (S3's ETags do), the storage only keeps it.
+enum class upload_kind {
+    single,     // in one request
+    multipart,  // part by part
+};
+
 struct object_info {
     sstring key;
     uint64_t size = 0;
@@ -80,6 +87,7 @@ struct object_info {
     object_attrs attrs;
     // The parts the object was committed from, in their order.
     std::vector<part_info> parts;
+    upload_kind upload = upload_kind::single;
 };
 
 /// The checksums of the parts' data concatenated, for those of the
@@ -179,7 +187,7 @@ protected:
                                         sstring src_key, std::optional<byte_range> range, precondition src_pre) = 0;
     virtual future<session_info> describe_session(sstring bucket, sstring key, session_id id) = 0;
     virtual future<object_info> commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
-                                               precondition pre) = 0;
+                                               precondition pre, upload_kind kind) = 0;
     virtual future<> abort_session(sstring bucket, sstring key, session_id id) = 0;
     virtual future<object_info> head_object(sstring bucket, sstring key) = 0;
     virtual future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range) = 0;
@@ -256,10 +264,10 @@ public:
     future<session_info> describe_session(sstring bucket, sstring key, session_id id);
     /// Publishes the listed parts, in the given order, as the session's
     /// object, replacing the current version atomically. Parts not listed
-    /// are dropped. Committing an already committed session returns the
-    /// same result again.
+    /// are dropped. The object's info records `kind`. Committing an already
+    /// committed session returns the same result again.
     future<object_info> commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
-                                       precondition pre);
+                                       precondition pre, upload_kind kind);
     future<> abort_session(sstring bucket, sstring key, session_id id);
 
     future<object_info> head_object(sstring bucket, sstring key);

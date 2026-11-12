@@ -75,6 +75,17 @@ def test_overwrite(plywood):
     assert r.headers["X-Labaz-Meta-v"] == "2"
 
 
+def test_upload_kind(plywood):
+    assert plywood.put("bkt", "single", b"x")["multipart"] is False
+    assert plywood.copy("bkt", "copy", "single")["multipart"] is False
+    s = plywood.open_session("bkt", "multi")
+    plywood.put_part("bkt", "multi", s, 1, b"x")
+    assert plywood.commit("bkt", "multi", s, [1])["multipart"] is True
+    assert plywood.commit("bkt", "multi", s, [1])["multipart"] is True  # a retry
+    listed = {o["key"]: o["multipart"] for o in plywood.list("bkt")["objects"]}
+    assert listed == {"single": False, "copy": False, "multi": True}
+
+
 def test_generation_precondition(plywood):
     expect_error("precondition_failed", 412, plywood.put, "bkt", "key", b"x", generation_match=1)
     g1 = plywood.put("bkt", "key", b"x", generation_match=0)["generation"]
@@ -622,11 +633,13 @@ def test_objects_survive_restart(run_labaz, tmp_path):
     c = PlywoodClient(f"http://127.0.0.1:{port}")
     c.create_bucket("bkt")
     info = c.put("bkt", "a/b", b"payload", metadata={"m": "v"}, checksums=["crc32c", "md5"])
+    s = c.open_session("bkt", "a/c")
+    c.put_part("bkt", "a/c", s, 1, b"part")
+    multi = c.commit("bkt", "a/c", s)
     assert server.stop() == 0
 
     server.start()
     c = PlywoodClient(f"http://127.0.0.1:{port}")
     assert c.list_buckets() == ["bkt"]
     assert c.read("bkt", "a/b") == b"payload"
-    [o] = c.list("bkt")["objects"]
-    assert o == info
+    assert c.list("bkt")["objects"] == [info, multi]

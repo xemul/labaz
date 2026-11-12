@@ -919,7 +919,7 @@ private:
                 auto in = make_verifying_stream(*req.content_stream, std::move(sums.expected));
                 co_await _storage.write_part(bucket, key, id, 1, in);
             }
-            info = co_await _storage.commit_session(bucket, key, id, {1}, pre);
+            info = co_await _storage.commit_session(bucket, key, id, {1}, pre, upload_kind::single);
         } catch (...) {
             ex = std::current_exception();
         }

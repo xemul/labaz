@@ -108,6 +108,7 @@ static void write_object_info(json_writer& w, const object_info& info) {
     w.Key("key"); write_string(w, info.key);
     w.Key("size"); w.Uint64(info.size);
     w.Key("generation"); w.Uint64(info.generation);
+    w.Key("multipart"); w.Bool(info.upload == upload_kind::multipart);
     w.Key("mtime_ns"); w.Int64(std::chrono::duration_cast<std::chrono::nanoseconds>(info.mtime.time_since_epoch()).count());
     w.Key("metadata"); write_metadata(w, info.attrs.metadata);
     w.Key("checksums"); write_checksums(w, object_checksums(info));
@@ -531,7 +532,7 @@ private:
         std::exception_ptr ex;
         try {
             co_await make_part(bucket, key, id);
-            info = co_await _storage.commit_session(bucket, key, id, {1}, pre);
+            info = co_await _storage.commit_session(bucket, key, id, {1}, pre, upload_kind::single);
         } catch (...) {
             ex = std::current_exception();
         }
@@ -641,7 +642,8 @@ private:
             }
         }
 
-        auto info = co_await _storage.commit_session(bucket, key, id, std::move(parts), precondition_from_headers(req));
+        auto info = co_await _storage.commit_session(bucket, key, id, std::move(parts), precondition_from_headers(req),
+                                                     upload_kind::multipart);
         co_return json_reply(std::move(rep), [&] (json_writer& w) { write_object_info(w, info); });
     }
 };
