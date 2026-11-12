@@ -344,15 +344,21 @@ public:
     explicit plywood_handler(func_type func) : _func(std::move(func)) {}
 
     future<std::unique_ptr<reply>> handle(const sstring&, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        std::unique_ptr<reply> err;
         try {
             co_return co_await _func(*req, std::move(rep));
         } catch (const storage_error& e) {
-            co_return error_reply(error_status(e.code()), to_string(e.code()), e.what());
+            err = error_reply(error_status(e.code()), to_string(e.code()), e.what());
         } catch (const bad_request& e) {
-            co_return error_reply(status::bad_request, "bad_request", e.what());
+            err = error_reply(status::bad_request, "bad_request", e.what());
         } catch (const checksum_mismatch& e) {
-            co_return error_reply(status::bad_request, "bad_digest", e.what());
+            err = error_reply(status::bad_request, "bad_digest", e.what());
         }
+        // The error reply replaces the one the server set up for the request.
+        if (req->_method == "HEAD") {
+            err->skip_body();
+        }
+        co_return std::move(err);
     }
 };
 

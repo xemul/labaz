@@ -281,14 +281,6 @@ def test_error_reply(s3_url, s3):
     assert root.find("RequestId").text == r.headers["x-amz-request-id"]
 
 
-def test_head_error_has_no_body(s3_url, s3):
-    with requests.Session() as session:
-        r = session.head(f"{s3_url}/bkt/nope")
-        assert (r.status_code, r.content) == (404, b"")
-        # The connection is still in sync.
-        assert session.get(f"{s3_url}/bkt/nope").status_code == 404
-
-
 @pytest.mark.parametrize("method, path, headers", [
     ("PUT", "/bkt/k?tagging", {}),
     ("GET", "/bkt/k?tagging", {}),

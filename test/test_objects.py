@@ -5,7 +5,9 @@
 `client` fixture), on the potato backend."""
 
 import os
+import socket
 import threading
+import urllib.parse
 
 import pytest
 
@@ -72,6 +74,22 @@ def test_head(client):
     o = client.head("bkt", "key")
     assert (o.size, o.metadata) == (5, {"m": "v"})
     expect_error(client, None, 404, client.head, "bkt", "nope")  # HEAD has no body
+
+
+def test_head_error_has_no_body(client):
+    # Raw HTTP: clients buffer what comes after the headers of a reply to
+    # HEAD and drop it, which would hide a body sent there.
+    with socket.create_connection(urllib.parse.urlparse(client.url).netloc.split(":")) as s:
+        s.settimeout(5)
+        s.sendall(b"HEAD /bkt/nope HTTP/1.1\r\nHost: x\r\n\r\n"
+                  b"GET /bkt/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        data = b""
+        while chunk := s.recv(65536):
+            data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 404 ")
+    # The reply to GET follows the headers of the reply to HEAD.
+    assert rest.startswith(b"HTTP/1.1 404 ")
 
 
 def test_empty_object(client):
