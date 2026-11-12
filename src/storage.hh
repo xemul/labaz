@@ -152,7 +152,8 @@ class storage_service;
 ///
 /// The public calls do that routing and are the same for every backend.
 /// Backends implement the do_*() calls, each of which is only made on the
-/// shard owning its object, so a backend never deals with other shards.
+/// shard owning its object. A backend that needs another object's shard
+/// (as a copy does its source's) reaches it with owner_of() and invoke_on().
 ///
 /// Keys are non-empty and must not end with '/'.
 class storage {
@@ -220,7 +221,6 @@ protected:
     virtual future<> do_delete_object(sstring bucket, sstring key) = 0;
     virtual future<listing> do_list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) = 0;
 
-private:
     unsigned owner_of(std::string_view bucket, std::string_view key) const {
         return _sharder.shard_of(bucket, key);
     }
@@ -252,5 +252,12 @@ public:
     storage& get() noexcept { return *_impl; }
     future<> stop();
 };
+
+template <typename Func>
+auto storage::invoke_on(unsigned shard, Func func) {
+    return _service->container().invoke_on(shard, [func = std::move(func)] (storage_service& s) mutable {
+        return func(s.get());
+    });
+}
 
 } // namespace labaz

@@ -74,13 +74,6 @@ checksums object_checksums(const object_info& info) {
 
 using namespace seastar;
 
-template <typename Func>
-auto storage::invoke_on(unsigned shard, Func func) {
-    return _service->container().invoke_on(shard, [func = std::move(func)] (storage_service& s) mutable {
-        return func(s.get());
-    });
-}
-
 // FIXME: bucket calls and listing run on the shard they are made on. That
 // is enough for a backend whose shards share all the data (potato), but one
 // keeping data per shard needs them fanned out to all shards (and listings

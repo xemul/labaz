@@ -19,6 +19,7 @@ Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
 <bucket>/<sha1(key)>/meta.json        object meta (JSON): the key, attributes, parts and slices
 <bucket>/<sha1(key)>/data.<gen>/      the object's parts
 <bucket>/<sha1(key)>/session.<id>/    an upload session's parts
+.staging/                             links of copies between shards
 ```
 
 - Keys are not encoded and do not map to paths, so any key works, of any
@@ -39,6 +40,12 @@ Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
   part files into the session (one link per slice) under the read lock, and
   records the slices that the copied range covers, so no data is copied and
   the copy does not depend on the source afterwards.
+- When another shard owns the source, the copy runs in two phases, so that
+  no shard waits for another's lock while holding its own: the source's
+  shard links its files into `.staging/` under its lock, then the
+  destination's shard links them from there into the session under its
+  lock, as it links a source of its own, and removes the staged links. Shard 0 empties `.staging/` on start. Bucket names
+  cannot start with a dot, so it is never taken for a bucket.
 - Checksums of a part are computed while it is written. A copied part gets
   those it can derive from the source's parts' checksums when it copies the
   whole source (all of a single part's, the combined CRCs of several parts),
@@ -47,7 +54,8 @@ Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
   The meta keeps the object's parts (sizes and checksums) besides its
   slices.
 - Every `do_*()` call is made on the shard owning its object (the generic
-  `storage` routes them there), so sessions can live in the memory of the
+  `storage` routes them there; only a copy reaches its source's shard
+  itself), so sessions can live in the memory of the
   shard that opened them. All shards share the data directory, so a restart
   with another number of shards finds every object; only in-progress
   sessions are lost, as on any restart.

@@ -10,6 +10,8 @@
 //                                                  attributes and the parts
 //   <data-dir>/<bucket>/<sha1(key)>/data.<gen>/    the object's parts
 //   <data-dir>/<bucket>/<sha1(key)>/session.<id>/  an upload session's parts
+//   <data-dir>/.staging/                           links of copies on their
+//                                                  way between shards
 //
 // Sealed part files are immutable. An object or a session part is a list
 // of slices (byte ranges) of them, and a copy hardlinks the source's files
@@ -20,9 +22,10 @@
 // overwrite is atomic, and a failure before the meta rename leaves the
 // current version intact.
 //
-// Every call is served on the shard it is made on. Sessions live in the
-// memory of the shard that opened them: in-progress uploads do not survive a
-// restart, committed objects do.
+// Every call is served on the shard it is made on, except that a copy links
+// its source's files on the source's shard. Sessions live in the memory of
+// the shard that opened them: in-progress uploads do not survive a restart,
+// committed objects do.
 
 #include "potato/potato_storage.hh"
 
@@ -63,6 +66,8 @@ static constexpr std::string_view meta_name = "meta.json";
 static constexpr std::string_view data_prefix = "data.";
 static constexpr std::string_view session_prefix = "session.";
 static constexpr std::string_view part_prefix = "part.";
+// Bucket names do not start with a dot.
+static constexpr std::string_view staging_name = ".staging";
 
 [[noreturn]] static void fail(errc code, std::string msg) {
     throw storage_error(code, std::move(msg));
@@ -110,7 +115,7 @@ static std::string object_dir_name(std::string_view key) {
 }
 
 static void validate_bucket_name(std::string_view b) {
-    if (b.empty() || b.size() > 63 || b == "." || b == ".."
+    if (b.empty() || b.size() > 63 || b.starts_with('.')
             || !std::ranges::all_of(b, [] (char c) { return is_plain_char(c); })) {
         fail(errc::invalid_argument, fmt::format("invalid bucket name '{}'", b));
     }
@@ -334,6 +339,14 @@ struct sealed_part {
     checksums sums;
 };
 
+// The bytes a copy links: slices of files in `dir`, and the checksums of
+// them known so far.
+struct copy_source {
+    fs::path dir;
+    std::vector<slice> slices;
+    checksums sums;
+};
+
 struct session_state {
     sstring bucket;
     sstring key;
@@ -349,10 +362,11 @@ class potato_storage final : public storage {
     std::unordered_map<session_id, session_state> _sessions;
     uint64_t _last_unique = 0;
     // Taken for write to publish, delete or abort, which remove directories;
-    // and for read to open an object's parts, so that they are not removed
-    // under the reader, and to create a session directory, so that its
-    // object directory is not removed meanwhile. Objects of a shard are
-    // served by that shard only, so a shard-wide lock covers all of them.
+    // and for read to open or link an object's parts, so that they are not
+    // removed under the reader or the copy, and to create a session
+    // directory or add files to it, so that it is not removed meanwhile.
+    // Objects of a shard are served by that shard only, so a shard-wide lock
+    // covers all of them.
     rwlock _lock;
 
 public:
@@ -363,6 +377,11 @@ public:
     future<> start() override {
         if (this_shard_id() == 0) {
             co_await recursive_touch_directory(_root.native());
+            // Drop the links of copies a restart interrupted.
+            if (co_await file_exists(staging_dir().native())) {
+                co_await recursive_remove_directory(staging_dir());
+            }
+            co_await make_directory(staging_dir().native());
             plog.info("Storing data in {}", _root.native());
         }
     }
@@ -393,7 +412,7 @@ public:
         std::vector<sstring> ret;
         auto dir = co_await open_directory(_root.native());
         co_await dir.list_directory([&ret] (directory_entry de) {
-            if (de.type == directory_entry_type::directory) {
+            if (de.type == directory_entry_type::directory && !de.name.starts_with('.')) {
                 ret.push_back(de.name);
             }
             return make_ready_future();
@@ -454,61 +473,38 @@ public:
     }
 
     future<part_info> do_copy_part(sstring bucket, sstring key, session_id id, unsigned number,
-                                sstring src_key, std::optional<byte_range> range, precondition src_pre) override {
+                                   sstring src_key, std::optional<byte_range> range, precondition src_pre) override {
         auto algorithms = active_session(bucket, key, id).attrs.checksums;
         auto dir = session_dir(bucket, key, id);
+        // A source of another shard is linked into the staging directory by
+        // that shard, under its own lock, and linked from there under this
+        // shard's, so no shard waits for a lock while holding its own.
+        std::optional<copy_source> staged;
+        if (auto owner = owner_of(bucket, src_key); owner != this_shard_id()) {
+            staged = co_await invoke_on(owner, [bucket, src_key, range, src_pre, algorithms] (storage& s) {
+                return static_cast<potato_storage&>(s).stage_source(bucket, src_key, range, src_pre, algorithms);
+            });
+        }
         sealed_part part{{}, 0, {}};
-        {
-            // The source's files are linked before an overwrite or delete
-            // can remove them; the links then live on their own.
-            // FIXME: the lock only excludes overwrites and deletes made on
-            // this shard, which owns the destination. The source may belong
-            // to another shard, whose writes to it the lock does not stop.
+        std::exception_ptr ex;
+        try {
+            // Keeps the source's files and the session directory in place;
+            // the links then live on their own.
             auto lock = co_await _lock.hold_read_lock();
-            auto m = co_await load_meta(bucket, src_key);
-            if (src_pre.generation_match && *src_pre.generation_match != m.info.generation) {
-                fail(errc::precondition_failed, fmt::format("source generation is {}, not {}",
-                                                            m.info.generation, *src_pre.generation_match));
-            }
-            auto [offset, length] = range ? resolve_range(*range, m.info.size) : resolved_range{0, m.info.size};
-            // What can be derived from the source's parts' checksums; the
-            // rest is computed from the data below.
-            if (offset == 0 && length == m.info.size) {
-                part.sums = concatenated_checksums(m.info.parts, algorithms);
-            }
-            auto src_dir = object_dir(bucket, src_key) / m.data_dir.c_str();
-            std::exception_ptr ex;
-            try {
-                for (auto& s : cut(m.slices, offset, length)) {
-                    auto name = sstring(fmt::format("{}{}.{:x}", part_prefix, number, next_unique()));
-                    co_await link_file((src_dir / s.file.c_str()).native(), (dir / name.c_str()).native());
-                    part.slices.push_back(slice{std::move(name), s.offset, s.size});
-                    part.size += s.size;
-                }
-            } catch (...) {
-                ex = std::current_exception();
-            }
-            if (ex) {
-                auto removed = co_await coroutine::as_future(remove_files(dir, part.slices));
-                removed.ignore_ready_future();
-                std::rethrow_exception(ex);
-            }
+            active_session(bucket, key, id);
+            auto src = staged ? *staged : co_await find_source(bucket, src_key, range, src_pre, algorithms);
+            part = co_await link_slices(src, dir, fmt::format("{}{}.", part_prefix, number));
+        } catch (...) {
+            ex = std::current_exception();
         }
-        std::set<checksum_algorithm> missing;
-        std::ranges::copy_if(algorithms, std::inserter(missing, missing.end()),
-                             [&part] (checksum_algorithm alg) { return !part.sums.contains(alg); });
-        if (!missing.empty()) {
-            // The links are the session's now, so they are read without
-            // the lock.
-            auto f = co_await coroutine::as_future(checksum_slices(dir, part.slices, std::move(missing)));
-            if (f.failed()) {
-                auto ex = f.get_exception();
-                auto removed = co_await coroutine::as_future(remove_files(dir, part.slices));
-                removed.ignore_ready_future();
-                std::rethrow_exception(ex);
-            }
-            part.sums.merge(f.get());
+        if (staged) {
+            auto removed = co_await coroutine::as_future(remove_files(staged->dir, staged->slices));
+            removed.ignore_ready_future();
         }
+        if (ex) {
+            std::rethrow_exception(ex);
+        }
+        co_await complete_checksums(dir, part, algorithms);
         co_return co_await add_part(bucket, key, id, number, std::move(part));
     }
 
@@ -646,6 +642,82 @@ private:
 
     fs::path session_dir(std::string_view bucket, std::string_view key, std::string_view id) const {
         return object_dir(bucket, key) / fmt::format("{}{}", session_prefix, id);
+    }
+
+    fs::path staging_dir() const {
+        return _root / staging_name;
+    }
+
+    // The source object's bytes (all of them, or the range), and what
+    // checksums of them can be derived from its parts'. The source's files
+    // stay as long as the lock is held.
+    future<copy_source> find_source(const sstring& bucket, const sstring& src_key, std::optional<byte_range> range,
+                                    precondition src_pre, const std::set<checksum_algorithm>& algorithms) {
+        auto m = co_await load_meta(bucket, src_key);
+        if (src_pre.generation_match && *src_pre.generation_match != m.info.generation) {
+            fail(errc::precondition_failed, fmt::format("source generation is {}, not {}",
+                                                        m.info.generation, *src_pre.generation_match));
+        }
+        auto [offset, length] = range ? resolve_range(*range, m.info.size) : resolved_range{0, m.info.size};
+        copy_source ret{object_dir(bucket, src_key) / m.data_dir.c_str(), cut(m.slices, offset, length), {}};
+        if (offset == 0 && length == m.info.size) {
+            ret.sums = concatenated_checksums(m.info.parts, algorithms);
+        }
+        co_return ret;
+    }
+
+    // Links the source's slices into `to`, in files named <prefix><unique>;
+    // on failure, removes the links made.
+    future<sealed_part> link_slices(const copy_source& src, fs::path to, sstring prefix) {
+        sealed_part part{{}, 0, src.sums};
+        std::exception_ptr ex;
+        try {
+            for (auto& s : src.slices) {
+                auto name = sstring(fmt::format("{}{:x}", prefix, next_unique()));
+                co_await link_file((src.dir / s.file.c_str()).native(), (to / name.c_str()).native());
+                part.slices.push_back(slice{std::move(name), s.offset, s.size});
+                part.size += s.size;
+            }
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        if (ex) {
+            auto removed = co_await coroutine::as_future(remove_files(to, part.slices));
+            removed.ignore_ready_future();
+            std::rethrow_exception(ex);
+        }
+        co_return part;
+    }
+
+    // Run on the source's shard for a copy to another shard: links the
+    // source's files into the staging directory, where they stay after the
+    // lock is released.
+    future<copy_source> stage_source(sstring bucket, sstring src_key, std::optional<byte_range> range,
+                                     precondition src_pre, std::set<checksum_algorithm> algorithms) {
+        auto lock = co_await _lock.hold_read_lock();
+        auto src = co_await find_source(bucket, src_key, range, src_pre, algorithms);
+        auto part = co_await link_slices(src, staging_dir(), fmt::format("{}.", this_shard_id()));
+        co_return copy_source{staging_dir(), std::move(part.slices), std::move(part.sums)};
+    }
+
+    // Computes the checksums the part lacks from its files in `dir`; on
+    // failure, removes them. The files are links of the copy's own, so
+    // they are read without the lock.
+    static future<> complete_checksums(fs::path dir, sealed_part& part, const std::set<checksum_algorithm>& algorithms) {
+        std::set<checksum_algorithm> missing;
+        std::ranges::copy_if(algorithms, std::inserter(missing, missing.end()),
+                             [&part] (checksum_algorithm alg) { return !part.sums.contains(alg); });
+        if (missing.empty()) {
+            co_return;
+        }
+        auto f = co_await coroutine::as_future(checksum_slices(dir, part.slices, std::move(missing)));
+        if (f.failed()) {
+            auto ex = f.get_exception();
+            auto removed = co_await coroutine::as_future(remove_files(dir, part.slices));
+            removed.ignore_ready_future();
+            std::rethrow_exception(ex);
+        }
+        part.sums.merge(f.get());
     }
 
     // Removes an object directory that has neither an object nor sessions

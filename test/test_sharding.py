@@ -4,6 +4,7 @@
 """Requests about objects that other shards own are routed to them."""
 
 import os
+import threading
 
 import pytest
 
@@ -128,3 +129,42 @@ def test_restart_with_other_shard_count(run_labaz, tmp_path):
     for c in clients(url):
         for key, data in objs.items():
             assert c.read("bkt", key) == data
+
+
+def shard_of(bucket: str, key: str, shards: int) -> int:
+    return int(digest("crc32c", f"{bucket}\0{key}".encode()), 16) % shards
+
+
+def test_copies_racing_overwrites(run_labaz, tmp_path):
+    """A copy from another shard's object is not broken by that shard
+    overwriting the object meanwhile."""
+    _, url = start(run_labaz, tmp_path / "data", SHARDS)
+    c = PlywoodClient(url)
+    c.create_bucket("bkt")
+    src = "src"
+    dst = next(k for k in (f"dst-{i}" for i in range(100)) if shard_of("bkt", k, SHARDS) != shard_of("bkt", src, SHARDS))
+    versions = [os.urandom(100000 + i) for i in range(2)]
+    c.put("bkt", src, versions[0])
+
+    done = threading.Event()
+
+    def overwrite():
+        w = PlywoodClient(url)
+        i = 0
+        while not done.is_set():
+            i += 1
+            w.put("bkt", src, versions[i % 2])
+
+    writer = threading.Thread(target=overwrite)
+    writer.start()
+    try:
+        for _ in range(200):
+            info = c.copy("bkt", dst, src, checksums=["crc32c", "sha256"])
+            data = c.read("bkt", dst)
+            assert data in versions
+            assert info["checksums"] == {"crc32c": digest("crc32c", data), "sha256": digest("sha256", data)}
+    finally:
+        done.set()
+        writer.join()
+    assert ".staging" not in c.list_buckets()
+    assert os.listdir(tmp_path / "data" / ".staging") == []
