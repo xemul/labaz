@@ -11,7 +11,9 @@ testing-only [plywood facade](docs/plywood-protocol.md), on top of the
 ## Building
 
 Seastar is a git submodule and is built along with Labaz.
-Its build dependencies must be installed (see `seastar/install-dependencies.sh`).
+Its build dependencies must be installed (see `seastar/install-dependencies.sh`), and
+Labaz's own: RapidJSON, GnuTLS, zlib and pugixml (on Fedora: `dnf install
+rapidjson-devel gnutls-devel zlib-ng-compat-devel pugixml-devel`).
 
 ```sh
 git submodule update --init --recursive

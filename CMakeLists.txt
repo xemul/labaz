@@ -35,6 +35,7 @@ add_subdirectory (seastar EXCLUDE_FROM_ALL)
 find_package (RapidJSON REQUIRED)
 find_package (GnuTLS REQUIRED)
 find_package (ZLIB REQUIRED)
+find_package (pugixml REQUIRED)
 
 add_executable (labaz
   src/main.cc
@@ -59,7 +60,8 @@ target_link_libraries (labaz
     Seastar::seastar
     RapidJSON
     GnuTLS::GnuTLS
-    ZLIB::ZLIB)
+    ZLIB::ZLIB
+    pugixml::pugixml)
 
 #
 # Tests.

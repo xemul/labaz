@@ -27,6 +27,8 @@ Every reply has an `x-amz-request-id` header. Replies to `HEAD` have no body.
 | bucket exists | 409 | `BucketAlreadyOwnedByYou` |
 | bucket not empty | 409 | `BucketNotEmpty` |
 | precondition failed | 412 | `PreconditionFailed` |
+| no such session | 404 | `NoSuchUpload` |
+| no such part | 400 | `InvalidPart` |
 | invalid argument | 400 | `InvalidArgument` |
 | invalid range | 416 | `InvalidRange` |
 | checksum mismatch | 400 | `BadDigest` |
@@ -55,16 +57,34 @@ GetObject and HeadObject reply with `Content-Length`, `ETag`, `Last-Modified`,
 `Accept-Ranges: bytes`, `Content-Type: binary/octet-stream` and the
 `x-amz-meta-*` headers.
 
-The `ETag` of an object is S3's: the quoted hex MD5 of its data, or for an
-object of several parts, the MD5 of the parts' MD5s followed by `-<parts>`.
-Objects written without an MD5 (through another facade) get an opaque ETag.
+The `ETag` of an object is S3's: the quoted hex MD5 of its data for
+PutObject, and for a multipart upload the MD5 of the parts' MD5s followed by
+`-<number of parts>`, whatever the number. Objects written without MD5s
+(through another facade) get an opaque ETag.
 
 Keys are up to 1024 bytes (`KeyTooLongError`). Keys ending with `/` are not
 supported and are refused with `InvalidArgument`.
 
+## Multipart uploads
+
+| Operation | Request | Notes |
+|---|---|---|
+| CreateMultipartUpload | `POST /{bucket}/{key}?uploads` | `x-amz-meta-*`, `x-amz-checksum-algorithm`, `x-amz-checksum-type` (below) |
+| UploadPart | `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}` | part numbers 1 to 10000; checksums as for PutObject; the reply's `ETag` is the part's MD5 |
+| CompleteMultipartUpload | `POST /{bucket}/{key}?uploadId={id}` | `If-None-Match: *`, `x-amz-mp-object-size`, `x-amz-checksum-<algorithm>` of the whole object |
+| AbortMultipartUpload | `DELETE /{bucket}/{key}?uploadId={id}` | 204 |
+| ListParts | `GET /{bucket}/{key}?uploadId={id}` | `max-parts`, `part-number-marker`; a part's `LastModified` is the epoch: the storage does not keep it |
+
+An upload id is a storage session id. CompleteMultipartUpload follows S3's
+rules: the parts are listed in ascending order (`InvalidPartOrder`), exist
+with the listed ETags and checksums (`InvalidPart`), and all but the last
+have at least 5 MiB (`EntityTooSmall`). Parts uploaded but not listed are
+dropped. Completing a completed upload again gives the same reply.
+
 ## Checksums
 
 Every object gets an MD5 (for its ETag) and, as S3 does by default, a
+CRC64NVME. Its S3 checksum algorithm is the one asked for at upload, or
 CRC64NVME.
 
 - `x-amz-checksum-<algorithm>: <base64>` on PutObject, for `crc32`, `crc32c`,
@@ -77,8 +97,15 @@ CRC64NVME.
   asked for, or of `crc64nvme` if none was, and `x-amz-checksum-type:
   FULL_OBJECT`.
 - GetObject and HeadObject with `x-amz-checksum-mode: ENABLED` reply with the
-  checksums the object keeps (all of them, not only the one asked for at
-  upload), unless only a range is asked for.
+  object's checksum, unless only a range is asked for.
+- A multipart upload's checksum is of S3's default type for its algorithm:
+  `COMPOSITE` (the checksum of the parts' checksums, followed by
+  `-<number of parts>`) for CRC32, CRC32C, SHA1 and SHA256, and
+  `FULL_OBJECT` (of the whole data) for CRC64NVME. Asking for `FULL_OBJECT`
+  with CRC32 or CRC32C fails with `NotImplemented`.
+- A part's checksum must be of its upload's algorithm, unless the upload has
+  the default one: then a part's checksum of another algorithm is verified,
+  but not kept.
 
 ## Listing
 
@@ -91,11 +118,14 @@ in byte order. Entries have `Key`, `LastModified`, `ETag`, `Size`,
 ## Not supported yet
 
 - Authentication (SigV4) and aws-chunked request bodies.
-- Multipart uploads, CopyObject and UploadPartCopy.
+- CopyObject and UploadPartCopy.
+- ListMultipartUploads: the storage does not list sessions.
 - Object tagging.
 - DeleteObjects, versioning and every other bucket sub-resource.
 - Conditional reads (`If-Match`, `If-None-Match`, `If-Modified-Since`,
-  `If-Unmodified-Since`), conditional writes other than `If-None-Match: *`,
-  `response-*` overrides, `partNumber` reads.
+  `If-Unmodified-Since`). boto3's `download_file` sends `If-Match` with its
+  ranged reads, so it fails.
+- Conditional writes other than `If-None-Match: *`, `response-*` overrides,
+  `partNumber` reads.
 - Stored system metadata: `Content-Type`, `Cache-Control` and the like
   given on PutObject are ignored.

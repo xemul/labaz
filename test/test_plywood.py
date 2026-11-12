@@ -123,7 +123,8 @@ def test_list_reports_object_info(plywood):
 
 # Sessions
 
-def test_session(plywood):
+def test_session_of_small_parts(plywood):
+    # Parts of any size, as plywood takes, which S3 does not.
     s = plywood.open_session("bkt", "obj", metadata={"m": "v"})
     assert plywood.put_part("bkt", "obj", s, 3, b"ccc") == {"number": 3, "size": 3, "checksums": {}}
     plywood.put_part("bkt", "obj", s, 1, b"a")
@@ -153,85 +154,21 @@ def test_session_part_order_is_commit_order(plywood):
     assert plywood.read("bkt", "obj") == b"21"
 
 
-def test_session_resent_part_replaces(plywood):
-    s = plywood.open_session("bkt", "obj")
-    plywood.put_part("bkt", "obj", s, 1, b"old")
-    plywood.put_part("bkt", "obj", s, 1, b"new!")
-    assert [p["size"] for p in plywood.describe_session("bkt", "obj", s)["parts"]] == [4]
-    plywood.commit("bkt", "obj", s, [1])
-    assert plywood.read("bkt", "obj") == b"new!"
-
-
-def test_session_commit_subset(plywood):
-    s = plywood.open_session("bkt", "obj")
-    for n in range(1, 5):
-        plywood.put_part("bkt", "obj", s, n, str(n).encode())
-    plywood.commit("bkt", "obj", s, [1, 3])
-    assert plywood.read("bkt", "obj") == b"13"
-
-
-def test_session_commit_errors(plywood):
+def test_session_commit_duplicate_part(plywood):
     s = plywood.open_session("bkt", "obj")
     plywood.put_part("bkt", "obj", s, 1, b"1")
-    expect_error("no_such_part", 404, plywood.commit, "bkt", "obj", s, [1, 2])
     expect_error("invalid_argument", 400, plywood.commit, "bkt", "obj", s, [1, 1])
     # The session survives a failed commit.
     plywood.commit("bkt", "obj", s, [1])
 
 
-def test_session_commit_retry(plywood):
-    s = plywood.open_session("bkt", "obj")
-    plywood.put_part("bkt", "obj", s, 1, b"1")
-    first = plywood.commit("bkt", "obj", s, [1])
-    assert plywood.commit("bkt", "obj", s, [1]) == first
-    expect_error("no_such_session", 404, plywood.put_part, "bkt", "obj", s, 2, b"2")
-    expect_error("no_such_session", 404, plywood.describe_session, "bkt", "obj", s)
-
-
-def test_session_commit_precondition(plywood):
+def test_session_commit_generation_match(plywood):
     g = plywood.put("bkt", "obj", b"x")["generation"]
     s = plywood.open_session("bkt", "obj")
     plywood.put_part("bkt", "obj", s, 1, b"y")
-    expect_error("precondition_failed", 412, plywood.commit, "bkt", "obj", s, [1], generation_match=0)
+    expect_error("precondition_failed", 412, plywood.commit, "bkt", "obj", s, [1], generation_match=g + 1)
     plywood.commit("bkt", "obj", s, [1], generation_match=g)
     assert plywood.read("bkt", "obj") == b"y"
-
-
-def test_session_abort(plywood):
-    s = plywood.open_session("bkt", "obj")
-    plywood.put_part("bkt", "obj", s, 1, b"1")
-    plywood.abort("bkt", "obj", s)
-    expect_error("no_such_session", 404, plywood.describe_session, "bkt", "obj", s)
-    expect_error("no_such_session", 404, plywood.commit, "bkt", "obj", s, [1])
-    expect_error("no_such_session", 404, plywood.abort, "bkt", "obj", s)
-    expect_error("no_such_key", 404, plywood.read, "bkt", "obj")
-
-
-def test_concurrent_sessions_of_one_object(plywood):
-    s1 = plywood.open_session("bkt", "obj")
-    s2 = plywood.open_session("bkt", "obj")
-    plywood.put_part("bkt", "obj", s1, 1, b"one")
-    plywood.put_part("bkt", "obj", s2, 1, b"two")
-    plywood.commit("bkt", "obj", s2)
-    assert plywood.read("bkt", "obj") == b"two"
-    plywood.commit("bkt", "obj", s1)
-    assert plywood.read("bkt", "obj") == b"one"
-
-
-def test_session_of_another_object(plywood):
-    plywood.create_bucket("other")
-    s = plywood.open_session("bkt", "obj")
-    for bucket, key in [("bkt", "obj2"), ("other", "obj")]:
-        expect_error("no_such_session", 404, plywood.put_part, bucket, key, s, 1, b"x")
-        expect_error("no_such_session", 404, plywood.describe_session, bucket, key, s)
-        expect_error("no_such_session", 404, plywood.commit, bucket, key, s)
-        expect_error("no_such_session", 404, plywood.abort, bucket, key, s)
-    plywood.abort("bkt", "obj", s)
-
-
-@pytest.mark.parametrize("session", ["nope", "0.zz", "99.1", "0.1", "../x", ""])
-def test_bad_session_ids(plywood, session):
-    expect_error("no_such_session", 404, plywood.describe_session, "bkt", "obj", session)
 
 
 def test_bad_parts_list(plywood):
@@ -263,15 +200,7 @@ def test_commit_without_session(plywood):
     expect_error("bad_request", 400, plywood.request, "PATCH", "/bkt/obj")
 
 
-def test_session_overwrites_atomically(plywood):
-    s = plywood.open_session("bkt", "obj")
-    plywood.put_part("bkt", "obj", s, 1, b"new")
-    plywood.put("bkt", "obj", b"old")
-    plywood.commit("bkt", "obj", s, [1])
-    assert plywood.read("bkt", "obj") == b"new"
-
-
-def test_range_across_parts(plywood):
+def test_range_across_small_parts(plywood):
     s = plywood.open_session("bkt", "obj")
     plywood.put_part("bkt", "obj", s, 1, b"0123")
     plywood.put_part("bkt", "obj", s, 2, b"")

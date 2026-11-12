@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """One client interface over every facade, for tests of what all of them
-do the same way. Each facade's client raises FacadeError, whose code is
-the facade's own; code() names it from the storage error code."""
+do the same way. Each facade's client raises FacadeError, whose code and
+status are the facade's own; error() gives them for a storage error code.
+
+Multipart uploads are plywood's sessions. As S3 requires, every part of
+an upload but the last must have at least PART_SIZE bytes."""
 
 import base64
 from dataclasses import dataclass, field
@@ -16,6 +19,7 @@ from facade_error import FacadeError
 from plywood_client import PlywoodClient
 
 FACADES = ["plywood", "s3"]
+PART_SIZE = 5 << 20
 
 
 @dataclass
@@ -36,6 +40,21 @@ def s3_client(url: str, **config) -> "botocore.client.S3":
                         region_name="us-east-1", config=Config(**cfg))
 
 
+# Storage error codes as (code, status) of the plywood facade.
+PLYWOOD_ERRORS = {
+    "no_such_bucket": ("no_such_bucket", 404),
+    "no_such_key": ("no_such_key", 404),
+    "no_such_session": ("no_such_session", 404),
+    "no_such_part": ("no_such_part", 404),
+    "bucket_exists": ("bucket_exists", 409),
+    "bucket_not_empty": ("bucket_not_empty", 409),
+    "invalid_argument": ("invalid_argument", 400),
+    "invalid_range": ("invalid_range", 416),
+    "precondition_failed": ("precondition_failed", 412),
+    "bad_digest": ("bad_digest", 400),
+}
+
+
 class PlywoodFacade:
     name = "plywood"
 
@@ -43,8 +62,8 @@ class PlywoodFacade:
         self.url = url
         self.c = PlywoodClient(url)
 
-    def code(self, errc: str) -> str:
-        return errc
+    def error(self, errc: str) -> tuple[str, int]:
+        return PLYWOOD_ERRORS[errc]
 
     def create_bucket(self, bucket):
         self.c.create_bucket(bucket)
@@ -86,17 +105,38 @@ class PlywoodFacade:
     def list_keys(self, bucket, prefix="", page=1000) -> list[str]:
         return self.c.list_keys(bucket, prefix=prefix, page=page)
 
+    # multipart uploads
 
-# Storage error codes as the s3 facade reports them.
-S3_CODES = {
-    "no_such_bucket": "NoSuchBucket",
-    "no_such_key": "NoSuchKey",
-    "bucket_exists": "BucketAlreadyOwnedByYou",
-    "bucket_not_empty": "BucketNotEmpty",
-    "invalid_argument": "InvalidArgument",
-    "invalid_range": "InvalidRange",
-    "precondition_failed": "PreconditionFailed",
-    "bad_digest": "BadDigest",
+    def open_upload(self, bucket, key, metadata: dict | None = None) -> str:
+        return self.c.open_session(bucket, key, metadata=metadata)
+
+    def upload_part(self, bucket, key, upload: str, number: int, data: bytes):
+        self.c.put_part(bucket, key, upload, number, data)
+
+    def list_parts(self, bucket, key, upload: str) -> list[tuple[int, int]]:
+        """[(number, size)]"""
+        return [(p["number"], p["size"]) for p in self.c.describe_session(bucket, key, upload)["parts"]]
+
+    def complete(self, bucket, key, upload: str, parts: list[int], must_not_exist: bool = False):
+        """Returns what the facade replies with, the same for a retry."""
+        return self.c.commit(bucket, key, upload, parts, generation_match=0 if must_not_exist else None)
+
+    def abort(self, bucket, key, upload: str):
+        self.c.abort(bucket, key, upload)
+
+
+# Storage error codes as (code, status) of the s3 facade.
+S3_ERRORS = {
+    "no_such_bucket": ("NoSuchBucket", 404),
+    "no_such_key": ("NoSuchKey", 404),
+    "no_such_session": ("NoSuchUpload", 404),
+    "no_such_part": ("InvalidPart", 400),
+    "bucket_exists": ("BucketAlreadyOwnedByYou", 409),
+    "bucket_not_empty": ("BucketNotEmpty", 409),
+    "invalid_argument": ("InvalidArgument", 400),
+    "invalid_range": ("InvalidRange", 416),
+    "precondition_failed": ("PreconditionFailed", 412),
+    "bad_digest": ("BadDigest", 400),
 }
 
 
@@ -106,9 +146,11 @@ class S3Facade:
     def __init__(self, url: str):
         self.url = url
         self.c = s3_client(url)
+        # The ETags of uploaded parts, which completing an upload lists.
+        self.etags = {}
 
-    def code(self, errc: str) -> str:
-        return S3_CODES[errc]
+    def error(self, errc: str) -> tuple[str, int]:
+        return S3_ERRORS[errc]
 
     def _call(self, method, **kwargs) -> dict:
         try:
@@ -169,6 +211,29 @@ class S3Facade:
             if not r["IsTruncated"]:
                 return keys
             token = r["NextContinuationToken"]
+
+    # multipart uploads
+
+    def open_upload(self, bucket, key, metadata: dict | None = None) -> str:
+        return self._call("create_multipart_upload", Bucket=bucket, Key=key, Metadata=metadata or {})["UploadId"]
+
+    def upload_part(self, bucket, key, upload: str, number: int, data: bytes):
+        r = self._call("upload_part", Bucket=bucket, Key=key, UploadId=upload, PartNumber=number, Body=data)
+        self.etags[(upload, number)] = r["ETag"]
+
+    def list_parts(self, bucket, key, upload: str) -> list[tuple[int, int]]:
+        r = self._call("list_parts", Bucket=bucket, Key=key, UploadId=upload)
+        return [(p["PartNumber"], p["Size"]) for p in r.get("Parts", [])]
+
+    def complete(self, bucket, key, upload: str, parts: list[int], must_not_exist: bool = False):
+        kwargs = {"IfNoneMatch": "*"} if must_not_exist else {}
+        listed = [{"PartNumber": n, "ETag": self.etags.get((upload, n), '"none"')} for n in parts]
+        r = self._call("complete_multipart_upload", Bucket=bucket, Key=key, UploadId=upload,
+                       MultipartUpload={"Parts": listed}, **kwargs)
+        return r["ETag"]
+
+    def abort(self, bucket, key, upload: str):
+        self._call("abort_multipart_upload", Bucket=bucket, Key=key, UploadId=upload)
 
 
 def make_client(facade: str, url: str):

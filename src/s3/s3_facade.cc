@@ -14,6 +14,8 @@
 
 #include <fmt/format.h>
 
+#include <pugixml.hpp>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/http/handlers.hh>
@@ -38,7 +40,11 @@ static constexpr std::string_view xml_type = "application/xml";
 // What S3 reports for objects uploaded without a Content-Type.
 static constexpr std::string_view default_object_type = "binary/octet-stream";
 static constexpr unsigned max_list_keys = 1000;
+static constexpr unsigned max_list_parts = 1000;
 static constexpr size_t max_key_length = 1024;
+static constexpr unsigned max_part_number = 10000;
+// Every part of a multipart upload but the last must have at least this.
+static constexpr uint64_t min_part_size = 5 << 20;
 // The only owner there is.
 static constexpr std::string_view owner_id = "labaz";
 
@@ -72,6 +78,17 @@ static s3_error invalid_argument(const std::string& msg) {
 
 static s3_error invalid_request(const std::string& msg) {
     return s3_error(status::bad_request, "InvalidRequest", msg);
+}
+
+static s3_error malformed_xml() {
+    return s3_error(status::bad_request, "MalformedXML",
+                    "The XML you provided was not well-formed or did not validate against our published schema.");
+}
+
+static s3_error invalid_part() {
+    return s3_error(status::bad_request, "InvalidPart",
+                    "One or more of the specified parts could not be found. The part may not have been uploaded, "
+                    "or the specified entity tag may not match the part's entity tag.");
 }
 
 // The S3 error for a storage error, with S3's own message where it has one.
@@ -348,6 +365,28 @@ static void for_each_prefixed_header(const request& req, std::string_view prefix
     }
 }
 
+static user_metadata metadata_from_headers(const request& req) {
+    user_metadata ret;
+    for_each_prefixed_header(req, meta_header_prefix, [&] (const sstring& k, const sstring& value) {
+        ret[k] = value;
+    });
+    return ret;
+}
+
+// The precondition of a write: only If-None-Match: * (the key must not
+// exist) is supported.
+static precondition write_precondition(const request& req) {
+    reject_headers(req, {"If-Match"});
+    precondition pre;
+    if (req._headers.contains("If-None-Match")) {
+        if (req.get_header("If-None-Match") != "*") {
+            throw not_implemented("An If-None-Match header other than '*'");
+        }
+        pre.generation_match = 0;
+    }
+    return pre;
+}
+
 // An algorithm of the x-amz-checksum-* headers, by its name in them
 // (in any case). MD5 is not one: it comes as Content-MD5.
 static std::optional<checksum_algorithm> s3_checksum_algorithm(std::string_view name) {
@@ -455,32 +494,153 @@ static std::optional<byte_range> range_from_headers(const request& req) {
 // Objects
 //
 
-// S3's ETag of an object: the MD5 of its data for a single part. For
-// several parts, each with an MD5, the MD5 of their MD5s followed by the
-// number of parts. Objects without MD5s get one made of their generation.
+// S3's ETag of an object: the MD5 of its data for a single upload, and the
+// MD5 of its parts' MD5s followed by the number of parts for a multipart
+// one. Objects without MD5s (written through other facades) get one made
+// of their generation.
 static sstring etag(const object_info& info) {
-    if (info.parts.size() <= 1) {
+    if (info.upload == upload_kind::multipart) {
+        if (std::ranges::all_of(info.parts, [] (const part_info& p) { return p.checksums.contains(checksum_algorithm::md5); })) {
+            checksummer md5({checksum_algorithm::md5});
+            for (auto& p : info.parts) {
+                md5.update(p.checksums.at(checksum_algorithm::md5));
+            }
+            return sstring(fmt::format("\"{}-{}\"", to_hex(md5.finish().at(checksum_algorithm::md5)), info.parts.size()));
+        }
+    } else if (info.parts.size() <= 1) {
         auto sums = object_checksums(info);
         if (auto it = sums.find(checksum_algorithm::md5); it != sums.end()) {
             return sstring(fmt::format("\"{}\"", to_hex(it->second)));
         }
-    } else if (std::ranges::all_of(info.parts, [] (const part_info& p) { return p.checksums.contains(checksum_algorithm::md5); })) {
-        checksummer md5({checksum_algorithm::md5});
-        for (auto& p : info.parts) {
-            md5.update(p.checksums.at(checksum_algorithm::md5));
-        }
-        return sstring(fmt::format("\"{}-{}\"", to_hex(md5.finish().at(checksum_algorithm::md5)), info.parts.size()));
     }
     return sstring(fmt::format("\"{:016x}\"", info.generation));
 }
 
-static void add_checksum_headers(reply& rep, const checksums& sums) {
-    for (auto& [alg, value] : sums) {
-        if (alg != checksum_algorithm::md5) {
-            rep.add_header(fmt::format("x-amz-checksum-{}", to_string(alg)), to_base64(value));
+// A part's ETag: the MD5 of its data.
+static sstring etag(const part_info& p) {
+    auto it = p.checksums.find(checksum_algorithm::md5);
+    return sstring(fmt::format("\"{}\"", it != p.checksums.end() ? to_hex(it->second) : ""));
+}
+
+// The checksum algorithm of an upload, as S3 has one: the one the client
+// asked for or, by default, CRC64NVME. The storage keeps it along with the
+// MD5 and the CRC64NVME every upload keeps.
+static checksum_algorithm upload_algorithm(const std::set<checksum_algorithm>& algorithms) {
+    for (auto a : algorithms) {
+        if (a != checksum_algorithm::md5 && a != checksum_algorithm::crc64nvme) {
+            return a;
         }
     }
-    rep.add_header("x-amz-checksum-type", "FULL_OBJECT");
+    return checksum_algorithm::crc64nvme;
+}
+
+// Whether a multipart upload's checksum of the algorithm is COMPOSITE (a
+// checksum of its parts' ones) rather than FULL_OBJECT (of all its data).
+// Only S3's default type of each algorithm is supported: COMPOSITE, but
+// for CRC64NVME, which can only be FULL_OBJECT.
+static bool is_composite(checksum_algorithm alg) {
+    return alg != checksum_algorithm::crc64nvme;
+}
+
+// The name of an algorithm in x-amz-checksum-algorithm and XML elements.
+static sstring algorithm_name(checksum_algorithm alg) {
+    sstring ret(to_string(alg));
+    std::ranges::transform(ret, ret.begin(), [] (char c) { return std::toupper(c); });
+    return ret;
+}
+
+// S3's checksum of an object or a part.
+struct s3_checksum {
+    checksum_algorithm algorithm;
+    // Base64; for a COMPOSITE one, followed by -<number of parts>.
+    sstring value;
+    bool composite;
+};
+
+static std::optional<s3_checksum> object_checksum(const object_info& info) {
+    auto alg = upload_algorithm(info.attrs.checksums);
+    if (info.upload == upload_kind::multipart && is_composite(alg)) {
+        checksummer sum({alg});
+        for (auto& p : info.parts) {
+            auto it = p.checksums.find(alg);
+            if (it == p.checksums.end()) {
+                return std::nullopt;
+            }
+            sum.update(it->second);
+        }
+        return s3_checksum{alg, sstring(fmt::format("{}-{}", to_base64(sum.finish().at(alg)), info.parts.size())), true};
+    }
+    auto sums = object_checksums(info);
+    auto it = sums.find(alg);
+    if (it == sums.end()) {
+        return std::nullopt;
+    }
+    return s3_checksum{alg, to_base64(it->second), false};
+}
+
+static void add_checksum_headers(reply& rep, const s3_checksum& c) {
+    rep.add_header(fmt::format("x-amz-checksum-{}", to_string(c.algorithm)), c.value);
+    rep.add_header("x-amz-checksum-type", c.composite ? "COMPOSITE" : "FULL_OBJECT");
+}
+
+static void write_checksum(xml_writer& w, const s3_checksum& c) {
+    w.element(fmt::format("Checksum{}", algorithm_name(c.algorithm)), c.value);
+    w.element("ChecksumType", c.composite ? "COMPOSITE" : "FULL_OBJECT");
+}
+
+static unsigned part_number(std::string_view s) {
+    auto n = parse_number<unsigned>(s);
+    if (!n || *n < 1 || *n > max_part_number) {
+        throw invalid_argument("Part number must be an integer between 1 and 10000, inclusive");
+    }
+    return *n;
+}
+
+// A part listed in a CompleteMultipartUpload request.
+struct completed_part {
+    unsigned number;
+    sstring etag;
+    checksums sums;
+};
+
+// Parses a CompleteMultipartUpload request body.
+static std::vector<completed_part> parse_completed_parts(std::string_view body) {
+    pugi::xml_document doc;
+    if (!doc.load_buffer(body.data(), body.size())) {
+        throw malformed_xml();
+    }
+    auto root = doc.child("CompleteMultipartUpload");
+    if (!root) {
+        throw malformed_xml();
+    }
+    std::vector<completed_part> ret;
+    for (auto p : root.children("Part")) {
+        auto n = parse_number<unsigned>(p.child_value("PartNumber"));
+        if (!n) {
+            throw malformed_xml();
+        }
+        std::string_view tag = p.child_value("ETag");
+        if (tag.size() >= 2 && tag.front() == '"' && tag.back() == '"') {
+            tag = tag.substr(1, tag.size() - 2);
+        }
+        completed_part cp{*n, sstring(fmt::format("\"{}\"", tag)), {}};
+        for (auto alg : {checksum_algorithm::crc32, checksum_algorithm::crc32c, checksum_algorithm::crc64nvme,
+                         checksum_algorithm::sha1, checksum_algorithm::sha256}) {
+            auto e = p.child(fmt::format("Checksum{}", algorithm_name(alg)).c_str());
+            if (e) {
+                auto v = from_base64(e.child_value());
+                if (!v) {
+                    throw invalid_request(fmt::format("Value for Checksum{} is invalid.", algorithm_name(alg)));
+                }
+                cp.sums.emplace(alg, std::move(*v));
+            }
+        }
+        ret.push_back(std::move(cp));
+    }
+    if (ret.empty()) {
+        throw malformed_xml();
+    }
+    return ret;
 }
 
 // The headers of GetObject and HeadObject replies. The checksums of the
@@ -493,7 +653,9 @@ static void add_object_headers(reply& rep, const request& req, const object_info
         rep.add_header(fmt::format("x-amz-meta-{}", k), v);
     }
     if (whole && equals_ignoring_case(req.get_header("x-amz-checksum-mode"), "ENABLED")) {
-        add_checksum_headers(rep, object_checksums(info));
+        if (auto c = object_checksum(info)) {
+            add_checksum_headers(rep, *c);
+        }
     }
 }
 
@@ -514,7 +676,7 @@ static uint64_t set_range(reply& rep, const std::optional<byte_range>& range, ui
 static void check_read_headers(const request& req) {
     reject_headers(req, {"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"});
     reject_query_params(req, {"acl", "attributes", "legal-hold", "partNumber", "restore", "retention", "select",
-                              "tagging", "torrent", "uploadId", "uploads", "versionId",
+                              "tagging", "torrent", "uploads", "versionId",
                               "response-cache-control", "response-content-disposition", "response-content-encoding",
                               "response-content-language", "response-content-type", "response-expires"});
 }
@@ -864,7 +1026,43 @@ private:
 
     // Objects
 
+    // Objects, or their multipart uploads with ?uploadId= (and ?uploads)
+
     future<std::unique_ptr<reply>> get_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("uploadId")) {
+            return list_parts(req, std::move(rep));
+        }
+        return get_whole_object(req, std::move(rep));
+    }
+
+    future<std::unique_ptr<reply>> put_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("uploadId") || req.has_query_param("partNumber")) {
+            return upload_part(req, std::move(rep));
+        }
+        return put_whole_object(req, std::move(rep));
+    }
+
+    future<std::unique_ptr<reply>> delete_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("uploadId")) {
+            return abort_multipart_upload(req, std::move(rep));
+        }
+        return delete_whole_object(req, std::move(rep));
+    }
+
+    future<std::unique_ptr<reply>> post_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("uploads")) {
+            return create_multipart_upload(req, std::move(rep));
+        }
+        if (req.has_query_param("uploadId")) {
+            return complete_multipart_upload(req, std::move(rep));
+        }
+        reject_query_params(req, {"restore", "select"});
+        throw not_implemented("POST on an object");
+    }
+
+    // Objects
+
+    future<std::unique_ptr<reply>> get_whole_object(request& req, std::unique_ptr<reply> rep) {
         check_read_headers(req);
         auto range = range_from_headers(req);
         auto r = co_await _storage.read_object(bucket_param(req), key_param(req), range);
@@ -888,22 +1086,14 @@ private:
         co_return std::move(rep);
     }
 
-    future<std::unique_ptr<reply>> put_object(request& req, std::unique_ptr<reply> rep) {
-        reject_query_params(req, {"acl", "legal-hold", "partNumber", "retention", "tagging", "uploadId"});
-        reject_headers(req, {"x-amz-copy-source", "x-amz-tagging", "If-Match"});
+    future<std::unique_ptr<reply>> put_whole_object(request& req, std::unique_ptr<reply> rep) {
+        reject_query_params(req, {"acl", "legal-hold", "retention", "tagging"});
+        reject_headers(req, {"x-amz-copy-source", "x-amz-tagging"});
         check_plain_body(req);
-        precondition pre;
-        if (req._headers.contains("If-None-Match")) {
-            if (req.get_header("If-None-Match") != "*") {
-                throw not_implemented("An If-None-Match header other than '*'");
-            }
-            pre.generation_match = 0;
-        }
+        auto pre = write_precondition(req);
         auto sums = upload_checksums_from_headers(req);
         object_attrs attrs;
-        for_each_prefixed_header(req, meta_header_prefix, [&] (const sstring& k, const sstring& value) {
-            attrs.metadata[k] = value;
-        });
+        attrs.metadata = metadata_from_headers(req);
         attrs.checksums = default_checksums;
         attrs.checksums.insert(sums.algorithms.begin(), sums.algorithms.end());
 
@@ -931,18 +1121,14 @@ private:
         }
 
         rep->add_header("ETag", etag(info));
-        // The checksums of the algorithms asked for, or the default one.
-        auto all = object_checksums(info);
-        checksums reported;
-        for (auto alg : sums.algorithms.empty() ? std::set{checksum_algorithm::crc64nvme} : sums.algorithms) {
-            reported.emplace(alg, all.at(alg));
+        if (auto c = object_checksum(info)) {
+            add_checksum_headers(*rep, *c);
         }
-        add_checksum_headers(*rep, reported);
         co_return empty_reply(std::move(rep), status::ok);
     }
 
-    future<std::unique_ptr<reply>> delete_object(request& req, std::unique_ptr<reply> rep) {
-        reject_query_params(req, {"tagging", "uploadId", "versionId"});
+    future<std::unique_ptr<reply>> delete_whole_object(request& req, std::unique_ptr<reply> rep) {
+        reject_query_params(req, {"tagging", "versionId"});
         try {
             co_await _storage.delete_object(bucket_param(req), key_param(req));
         } catch (const storage_error& e) {
@@ -954,9 +1140,254 @@ private:
         co_return empty_reply(std::move(rep), status::no_content);
     }
 
-    future<std::unique_ptr<reply>> post_object(request& req, std::unique_ptr<reply>) {
-        reject_query_params(req, {"restore", "select", "uploadId", "uploads"});
-        throw not_implemented("POST on an object");
+    // Multipart uploads, which are the storage's sessions
+
+    future<std::unique_ptr<reply>> create_multipart_upload(request& req, std::unique_ptr<reply> rep) {
+        reject_headers(req, {"x-amz-tagging"});
+        object_attrs attrs;
+        attrs.metadata = metadata_from_headers(req);
+        attrs.checksums = default_checksums;
+        std::optional<checksum_algorithm> alg;
+        if (auto name = req.get_header("x-amz-checksum-algorithm"); !name.empty()) {
+            alg = s3_checksum_algorithm(name);
+            if (!alg) {
+                throw invalid_request(fmt::format("Unsupported checksum algorithm '{}'", name));
+            }
+            attrs.checksums.insert(*alg);
+        }
+        if (auto type = req.get_header("x-amz-checksum-type"); !type.empty()) {
+            if (!alg) {
+                throw invalid_request("The x-amz-checksum-type header requires the x-amz-checksum-algorithm header.");
+            }
+            if (type != "COMPOSITE" && type != "FULL_OBJECT") {
+                throw invalid_request("Value for x-amz-checksum-type header is invalid.");
+            }
+            if ((type == "COMPOSITE") != is_composite(*alg)) {
+                if (*alg == checksum_algorithm::crc32 || *alg == checksum_algorithm::crc32c) {
+                    throw not_implemented(fmt::format("The {} checksum type of {}", type, algorithm_name(*alg)));
+                }
+                throw invalid_request(fmt::format("The {} checksum type cannot be used with the {} checksum algorithm.",
+                                                  type, algorithm_name(*alg)));
+            }
+        }
+
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto id = co_await _storage.open_session(bucket, key, std::move(attrs));
+        if (alg) {
+            rep->add_header("x-amz-checksum-algorithm", algorithm_name(*alg));
+            rep->add_header("x-amz-checksum-type", is_composite(*alg) ? "COMPOSITE" : "FULL_OBJECT");
+        }
+        xml_writer w;
+        w.root("InitiateMultipartUploadResult");
+        w.element("Bucket", bucket).element("Key", key).element("UploadId", id);
+        w.close("InitiateMultipartUploadResult");
+        co_return xml_reply(std::move(rep), w);
+    }
+
+    future<std::unique_ptr<reply>> upload_part(request& req, std::unique_ptr<reply> rep) {
+        if (!req.has_query_param("uploadId") || !req.has_query_param("partNumber")) {
+            throw invalid_request("Uploading a part requires both partNumber and uploadId");
+        }
+        reject_headers(req, {"x-amz-copy-source"});
+        check_plain_body(req);
+        auto number = part_number(req.get_query_param("partNumber"));
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto id = req.get_query_param("uploadId");
+        auto sums = upload_checksums_from_headers(req);
+
+        // A part may carry a checksum of another algorithm than its upload
+        // only if the upload has the default one; it is verified, not kept.
+        auto session = co_await _storage.describe_session(bucket, key, id);
+        auto alg = upload_algorithm(session.attrs.checksums);
+        if (alg != checksum_algorithm::crc64nvme) {
+            for (auto a : sums.algorithms) {
+                if (a != alg) {
+                    throw invalid_request(fmt::format("Checksum Type mismatch occurred, expected checksum Type: {}, "
+                                                      "actual checksum Type: {}", to_string(alg), to_string(a)));
+                }
+            }
+        }
+
+        part_info p;
+        if (sums.expected.empty()) {
+            p = co_await _storage.write_part(bucket, key, id, number, *req.content_stream);
+        } else {
+            auto in = make_verifying_stream(*req.content_stream, sums.expected);
+            p = co_await _storage.write_part(bucket, key, id, number, in);
+        }
+
+        rep->add_header("ETag", etag(p));
+        if (auto it = p.checksums.find(alg); it != p.checksums.end()) {
+            rep->add_header(fmt::format("x-amz-checksum-{}", to_string(alg)), to_base64(it->second));
+        }
+        for (auto& [a, value] : sums.expected) {
+            if (a != checksum_algorithm::md5 && a != alg) {
+                rep->add_header(fmt::format("x-amz-checksum-{}", to_string(a)), to_base64(value));
+            }
+        }
+        co_return empty_reply(std::move(rep), status::ok);
+    }
+
+    future<std::unique_ptr<reply>> complete_multipart_upload(request& req, std::unique_ptr<reply> rep) {
+        auto pre = write_precondition(req);
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto id = req.get_query_param("uploadId");
+        auto parts = parse_completed_parts(co_await util::read_entire_stream_contiguous(*req.content_stream));
+        std::vector<unsigned> numbers;
+        for (auto& p : parts) {
+            if (!numbers.empty() && p.number <= numbers.back()) {
+                throw s3_error(status::bad_request, "InvalidPartOrder",
+                               "The list of parts was not in ascending order. Parts must be ordered by part number.");
+            }
+            numbers.push_back(p.number);
+        }
+
+        // A completed upload is no session any more, and completing it
+        // again gets the same reply from the storage.
+        auto f = co_await coroutine::as_future(_storage.describe_session(bucket, key, id));
+        if (f.failed()) {
+            auto ex = f.get_exception();
+            try {
+                std::rethrow_exception(ex);
+            } catch (const storage_error& e) {
+                if (e.code() != errc::no_such_session) {
+                    throw;
+                }
+            }
+        } else {
+            check_completed_parts(req, f.get(), parts);
+        }
+
+        auto info = co_await _storage.commit_session(bucket, key, id, std::move(numbers), pre, upload_kind::multipart);
+        xml_writer w;
+        w.root("CompleteMultipartUploadResult");
+        w.element("Location", url_path(req)).element("Bucket", bucket).element("Key", key).element("ETag", etag(info));
+        if (auto c = object_checksum(info)) {
+            write_checksum(w, *c);
+        }
+        w.close("CompleteMultipartUploadResult");
+        co_return xml_reply(std::move(rep), w);
+    }
+
+    // Checks the parts listed to complete an upload against the uploaded
+    // ones, and the object they make against the request's headers.
+    static void check_completed_parts(const request& req, const session_info& session, const std::vector<completed_part>& parts) {
+        std::map<unsigned, const part_info*> uploaded;
+        for (auto& p : session.parts) {
+            uploaded.emplace(p.number, &p);
+        }
+        object_info whole;
+        whole.attrs = session.attrs;
+        whole.upload = upload_kind::multipart;
+        for (size_t i = 0; i < parts.size(); i++) {
+            auto it = uploaded.find(parts[i].number);
+            if (it == uploaded.end() || etag(*it->second) != parts[i].etag) {
+                throw invalid_part();
+            }
+            auto& p = *it->second;
+            for (auto& [alg, value] : parts[i].sums) {
+                if (auto s = p.checksums.find(alg); s != p.checksums.end() && s->second != value) {
+                    throw invalid_part();
+                }
+            }
+            if (i + 1 < parts.size() && p.size < min_part_size) {
+                throw s3_error(status::bad_request, "EntityTooSmall",
+                               "Your proposed upload is smaller than the minimum allowed object size.");
+            }
+            whole.parts.push_back(p);
+            whole.size += p.size;
+        }
+
+        if (auto size = req.get_header("x-amz-mp-object-size"); !size.empty()) {
+            if (parse_number<uint64_t>(size) != whole.size) {
+                throw invalid_request("The provided x-amz-mp-object-size does not match the size of the object.");
+            }
+        }
+        // The checksum of the whole object, if given, must be the object's.
+        auto c = object_checksum(whole);
+        for_each_prefixed_header(req, checksum_header_prefix, [&] (const sstring& name, const sstring& value) {
+            if (name == "type" || name == "algorithm" || name == "mode") {
+                return;
+            }
+            if (!c || name != to_string(c->algorithm)) {
+                throw invalid_request(fmt::format("The upload has no {} checksum.", name));
+            }
+            if (value != c->value) {
+                throw s3_error(status::bad_request, "BadDigest",
+                               "The checksum you specified did not match the calculated checksum.");
+            }
+        });
+    }
+
+    future<std::unique_ptr<reply>> abort_multipart_upload(request& req, std::unique_ptr<reply> rep) {
+        co_await _storage.abort_session(bucket_param(req), key_param(req), req.get_query_param("uploadId"));
+        co_return empty_reply(std::move(rep), status::no_content);
+    }
+
+    future<std::unique_ptr<reply>> list_parts(request& req, std::unique_ptr<reply> rep) {
+        unsigned max_parts = max_list_parts;
+        if (req.has_query_param("max-parts")) {
+            auto n = parse_number<unsigned>(req.get_query_param("max-parts"));
+            if (!n) {
+                throw invalid_argument("Provided max-parts not an integer or within integer range");
+            }
+            max_parts = std::min(*n, max_list_parts);
+        }
+        unsigned marker = 0;
+        if (req.has_query_param("part-number-marker")) {
+            auto n = parse_number<unsigned>(req.get_query_param("part-number-marker"));
+            if (!n) {
+                throw invalid_argument("Provided part-number-marker not an integer or within integer range");
+            }
+            marker = *n;
+        }
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto session = co_await _storage.describe_session(bucket, key, req.get_query_param("uploadId"));
+        auto alg = upload_algorithm(session.attrs.checksums);
+
+        std::vector<const part_info*> listed;
+        bool truncated = false;
+        for (auto& p : session.parts) {
+            if (p.number <= marker) {
+                continue;
+            }
+            if (listed.size() == max_parts) {
+                truncated = true;
+                break;
+            }
+            listed.push_back(&p);
+        }
+
+        xml_writer w;
+        w.root("ListPartsResult");
+        w.element("Bucket", bucket).element("Key", key).element("UploadId", session.id);
+        w.element("PartNumberMarker", marker);
+        w.element("NextPartNumberMarker", listed.empty() ? marker : listed.back()->number);
+        w.element("MaxParts", max_parts);
+        w.element("IsTruncated", truncated ? "true" : "false");
+        for (auto* p : listed) {
+            w.open("Part");
+            w.element("PartNumber", p->number);
+            // The storage does not keep when parts were uploaded.
+            w.element("LastModified", iso8601_date(clock_type::time_point()));
+            w.element("ETag", etag(*p));
+            w.element("Size", p->size);
+            if (auto it = p->checksums.find(alg); it != p->checksums.end()) {
+                w.element(fmt::format("Checksum{}", algorithm_name(alg)), to_base64(it->second));
+            }
+            w.close("Part");
+        }
+        w.open("Initiator").element("ID", owner_id).element("DisplayName", owner_id).close("Initiator");
+        w.open("Owner").element("ID", owner_id).element("DisplayName", owner_id).close("Owner");
+        w.element("StorageClass", "STANDARD");
+        w.element("ChecksumAlgorithm", algorithm_name(alg));
+        w.element("ChecksumType", is_composite(alg) ? "COMPOSITE" : "FULL_OBJECT");
+        w.close("ListPartsResult");
+        co_return xml_reply(std::move(rep), w);
     }
 };
 

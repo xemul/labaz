@@ -13,18 +13,24 @@ import pytest
 
 from conftest import free_port
 from facade_error import FacadeError
-from facades import FACADES, make_client
+from facades import FACADES, PART_SIZE, make_client
 from test_plywood import digest
 
 
-def expect_error(client, errc: str | None, status: int, func, *args, **kwargs):
-    """Expects func() to fail with `status` and the facade's code for the
-    storage error code `errc`; None skips the code, e.g. for HEAD."""
+def expect_error(client, errc: str, func, *args, **kwargs):
+    """Expects func() to fail with the facade's code and status for the
+    storage error code `errc`."""
+    with pytest.raises(FacadeError) as e:
+        func(*args, **kwargs)
+    assert (e.value.code, e.value.status) == client.error(errc)
+
+
+def expect_status(status: int, func, *args, **kwargs):
+    """Expects func() to fail with `status`, e.g. a HEAD, which has no body
+    to carry an error code."""
     with pytest.raises(FacadeError) as e:
         func(*args, **kwargs)
     assert e.value.status == status
-    if errc is not None:
-        assert e.value.code == client.code(errc)
 
 
 # Buckets
@@ -32,15 +38,15 @@ def expect_error(client, errc: str | None, status: int, func, *args, **kwargs):
 def test_buckets(client):
     client.create_bucket("bkt2")
     assert client.list_buckets() == ["bkt", "bkt2"]
-    expect_error(client, "bucket_exists", 409, client.create_bucket, "bkt2")
+    expect_error(client, "bucket_exists", client.create_bucket, "bkt2")
     client.delete_bucket("bkt2")
     assert client.list_buckets() == ["bkt"]
-    expect_error(client, "no_such_bucket", 404, client.delete_bucket, "bkt2")
+    expect_error(client, "no_such_bucket", client.delete_bucket, "bkt2")
 
 
 def test_delete_non_empty_bucket(client):
     client.put("bkt", "k", b"x")
-    expect_error(client, "bucket_not_empty", 409, client.delete_bucket, "bkt")
+    expect_error(client, "bucket_not_empty", client.delete_bucket, "bkt")
     client.delete("bkt", "k")
     client.delete_bucket("bkt")
 
@@ -54,10 +60,10 @@ def test_deleted_objects_leave_bucket_empty(client):
 
 
 def test_no_such_bucket(client):
-    expect_error(client, "no_such_bucket", 404, client.put, "nope", "k", b"x")
-    expect_error(client, "no_such_bucket", 404, client.read, "nope", "k")
-    expect_error(client, "no_such_bucket", 404, client.list, "nope")
-    expect_error(client, "no_such_bucket", 404, client.delete, "nope", "k")
+    expect_error(client, "no_such_bucket", client.put, "nope", "k", b"x")
+    expect_error(client, "no_such_bucket", client.read, "nope", "k")
+    expect_error(client, "no_such_bucket", client.list, "nope")
+    expect_error(client, "no_such_bucket", client.delete, "nope", "k")
 
 
 # Objects
@@ -73,7 +79,7 @@ def test_head(client):
     client.put("bkt", "key", b"hello", metadata={"m": "v"})
     o = client.head("bkt", "key")
     assert (o.size, o.metadata) == (5, {"m": "v"})
-    expect_error(client, None, 404, client.head, "bkt", "nope")  # HEAD has no body
+    expect_status(404, client.head, "bkt", "nope")
 
 
 def test_head_error_has_no_body(client):
@@ -107,11 +113,11 @@ def test_large_object(client):
 def test_delete(client):
     client.put("bkt", "key", b"x")
     client.delete("bkt", "key")
-    expect_error(client, "no_such_key", 404, client.read, "bkt", "key")
+    expect_error(client, "no_such_key", client.read, "bkt", "key")
     if client.name == "s3":
         client.delete("bkt", "key")  # deleting a missing key succeeds in S3
     else:
-        expect_error(client, "no_such_key", 404, client.delete, "bkt", "key")
+        expect_error(client, "no_such_key", client.delete, "bkt", "key")
 
 
 def test_overwrite(client):
@@ -138,7 +144,7 @@ def test_range(client, rng, expected, content_range):
 @pytest.mark.parametrize("rng", ["bytes=10-", "bytes=10-20", "bytes=-0"])
 def test_unsatisfiable_range(client, rng):
     client.put("bkt", "key", b"0123456789")
-    expect_error(client, "invalid_range", 416, client.read, "bkt", "key", range=rng)
+    expect_error(client, "invalid_range", client.read, "bkt", "key", range=rng)
 
 
 # Keys
@@ -164,7 +170,7 @@ def test_key_round_trip(client, key):
 @pytest.mark.parametrize("key", ["dir/", "a/b/"])
 def test_key_ending_with_slash(client, key):
     # Not supported, which S3 does support.
-    expect_error(client, "invalid_argument", 400, client.put, "bkt", key, b"x")
+    expect_error(client, "invalid_argument", client.put, "bkt", key, b"x")
     assert client.list_keys("bkt") == []
 
 
@@ -214,14 +220,134 @@ def test_list_reports_object_info(client):
     assert objects == [{"key": "k", "size": 5}]
 
 
+# Multipart uploads
+
+BIG = b"a" * PART_SIZE
+
+
+def test_upload(client):
+    u = client.open_upload("bkt", "obj", metadata={"m": "v"})
+    client.upload_part("bkt", "obj", u, 3, b"ccc")
+    client.upload_part("bkt", "obj", u, 1, BIG)
+    client.upload_part("bkt", "obj", u, 2, BIG)
+    assert client.list_parts("bkt", "obj", u) == [(1, PART_SIZE), (2, PART_SIZE), (3, 3)]
+    client.complete("bkt", "obj", u, [1, 2, 3])
+    o = client.get("bkt", "obj")
+    assert (o.data, o.metadata) == (BIG + BIG + b"ccc", {"m": "v"})
+
+
+def test_upload_resent_part_replaces(client):
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, b"old")
+    client.upload_part("bkt", "obj", u, 1, b"new!")
+    assert client.list_parts("bkt", "obj", u) == [(1, 4)]
+    client.complete("bkt", "obj", u, [1])
+    assert client.read("bkt", "obj") == b"new!"
+
+
+def test_upload_complete_subset(client):
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, BIG)
+    for n in range(2, 5):
+        client.upload_part("bkt", "obj", u, n, str(n).encode())
+    client.complete("bkt", "obj", u, [1, 3])
+    assert client.read("bkt", "obj") == BIG + b"3"
+
+
+def test_upload_complete_missing_part(client):
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, BIG)
+    expect_error(client, "no_such_part", client.complete, "bkt", "obj", u, [1, 2])
+    # The upload survives a failed completion.
+    client.complete("bkt", "obj", u, [1])
+
+
+def test_upload_complete_retry(client):
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, b"1")
+    first = client.complete("bkt", "obj", u, [1])
+    assert client.complete("bkt", "obj", u, [1]) == first
+    expect_error(client, "no_such_session", client.upload_part, "bkt", "obj", u, 2, b"2")
+    expect_error(client, "no_such_session", client.list_parts, "bkt", "obj", u)
+
+
+def test_upload_must_not_exist(client):
+    client.put("bkt", "obj", b"x")
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, b"y")
+    expect_error(client, "precondition_failed", client.complete, "bkt", "obj", u, [1], must_not_exist=True)
+    assert client.read("bkt", "obj") == b"x"
+    u = client.open_upload("bkt", "new")
+    client.upload_part("bkt", "new", u, 1, b"y")
+    client.complete("bkt", "new", u, [1], must_not_exist=True)
+    assert client.read("bkt", "new") == b"y"
+
+
+def test_upload_abort(client):
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, b"1")
+    client.abort("bkt", "obj", u)
+    expect_error(client, "no_such_session", client.list_parts, "bkt", "obj", u)
+    expect_error(client, "no_such_session", client.complete, "bkt", "obj", u, [1])
+    expect_error(client, "no_such_session", client.abort, "bkt", "obj", u)
+    expect_error(client, "no_such_key", client.read, "bkt", "obj")
+
+
+def test_concurrent_uploads_of_one_object(client):
+    u1 = client.open_upload("bkt", "obj")
+    u2 = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u1, 1, b"one")
+    client.upload_part("bkt", "obj", u2, 1, b"two")
+    client.complete("bkt", "obj", u2, [1])
+    assert client.read("bkt", "obj") == b"two"
+    client.complete("bkt", "obj", u1, [1])
+    assert client.read("bkt", "obj") == b"one"
+
+
+def test_upload_of_another_object(client):
+    client.create_bucket("other")
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, b"1")
+    for bucket, key in [("bkt", "obj2"), ("other", "obj")]:
+        expect_error(client, "no_such_session", client.upload_part, bucket, key, u, 1, b"x")
+        expect_error(client, "no_such_session", client.list_parts, bucket, key, u)
+        expect_error(client, "no_such_session", client.abort, bucket, key, u)
+    client.abort("bkt", "obj", u)
+
+
+@pytest.mark.parametrize("upload", ["nope", "0.zz", "99.1", "0.1", "../x", ""])
+def test_bad_upload_ids(client, upload):
+    expect_error(client, "no_such_session", client.list_parts, "bkt", "obj", upload)
+
+
+def test_upload_overwrites_atomically(client):
+    u = client.open_upload("bkt", "obj")
+    client.upload_part("bkt", "obj", u, 1, b"new")
+    client.put("bkt", "obj", b"old")
+    client.complete("bkt", "obj", u, [1])
+    assert client.read("bkt", "obj") == b"new"
+
+
+def test_range_across_parts(client):
+    u = client.open_upload("bkt", "obj")
+    parts = [bytes([65 + i]) * PART_SIZE for i in range(2)] + [b"tail"]
+    for n, data in enumerate(parts, 1):
+        client.upload_part("bkt", "obj", u, n, data)
+    client.complete("bkt", "obj", u, [1, 2, 3])
+    data = b"".join(parts)
+    for first, last in [(0, 0), (PART_SIZE - 2, PART_SIZE + 1), (PART_SIZE, PART_SIZE),
+                        (PART_SIZE - 1, 2 * PART_SIZE + 1), (2 * PART_SIZE - 1, len(data) - 1)]:
+        assert client.read("bkt", "obj", range=f"bytes={first}-{last}") == data[first:last + 1]
+
+
 # Checksums
 
 def test_verify_object(client):
     data = b"payload"
     client.put("bkt", "obj", data, verify={"crc32c": digest("crc32c", data)})
     client.put("bkt", "obj", data, verify={"md5": digest("md5", data)})
-    expect_error(client, "bad_digest", 400, client.put, "bkt", "obj", b"other", verify={"md5": digest("md5", data)})
-    expect_error(client, "bad_digest", 400, client.put, "bkt", "obj", b"other", verify={"sha256": digest("sha256", data)})
+    expect_error(client, "bad_digest", client.put, "bkt", "obj", b"other", verify={"md5": digest("md5", data)})
+    expect_error(client, "bad_digest", client.put, "bkt", "obj", b"other", verify={"sha256": digest("sha256", data)})
     assert client.read("bkt", "obj") == data
 
 

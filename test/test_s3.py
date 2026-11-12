@@ -8,13 +8,14 @@ in test_objects.py."""
 import base64
 import datetime
 import hashlib
+import os
 import xml.etree.ElementTree as ET
 
 import botocore
 import pytest
 import requests
 
-from facades import s3_client
+from facades import PART_SIZE, s3_client
 from test_plywood import digest
 
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
@@ -162,6 +163,152 @@ def test_bad_checksum_headers(s3_url):
         assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "InvalidRequest"), headers
 
 
+# Multipart uploads
+
+def upload(s3, key: str, parts: list[bytes], **create) -> tuple[str, list[dict]]:
+    """Uploads the parts of a new upload, returning its id and the parts to
+    complete it with."""
+    u = s3.create_multipart_upload(Bucket="bkt", Key=key, **create)["UploadId"]
+    # Or boto3 sends its default CRC32 with the parts, which S3 refuses
+    # for an upload of another algorithm.
+    alg = {"ChecksumAlgorithm": create["ChecksumAlgorithm"]} if "ChecksumAlgorithm" in create else {}
+    listed = []
+    for n, data in enumerate(parts, 1):
+        r = s3.upload_part(Bucket="bkt", Key=key, UploadId=u, PartNumber=n, Body=data, **alg)
+        listed.append({"PartNumber": n, "ETag": r["ETag"]})
+    return u, listed
+
+
+def complete(s3, key: str, u: str, parts: list[dict], **kwargs) -> dict:
+    return s3.complete_multipart_upload(Bucket="bkt", Key=key, UploadId=u, MultipartUpload={"Parts": parts}, **kwargs)
+
+
+def multipart_etag(parts: list[bytes]) -> str:
+    md5s = b"".join(hashlib.md5(p).digest() for p in parts)
+    return f'"{hashlib.md5(md5s).hexdigest()}-{len(parts)}"'
+
+
+@pytest.mark.parametrize("sizes", [[0], [10], [PART_SIZE, 1], [PART_SIZE, PART_SIZE + 1, 0]])
+def test_multipart_etag(s3, sizes):
+    parts = [os.urandom(n) for n in sizes]
+    u, listed = upload(s3, "k", parts)
+    assert [p["ETag"] for p in listed] == [md5_etag(p) for p in parts]
+    assert complete(s3, "k", u, listed)["ETag"] == multipart_etag(parts)
+    assert s3.head_object(Bucket="bkt", Key="k")["ETag"] == multipart_etag(parts)
+    [o] = s3.list_objects_v2(Bucket="bkt")["Contents"]
+    assert o["ETag"] == multipart_etag(parts)
+
+
+def composite(alg: str, parts: list[bytes]) -> str:
+    """The base64 COMPOSITE checksum of the parts."""
+    sums = b"".join(bytes.fromhex(digest(alg, p)) for p in parts)
+    return f"{base64.b64encode(bytes.fromhex(digest(alg, sums))).decode()}-{len(parts)}"
+
+
+@pytest.mark.parametrize("alg", [None, "crc32", "crc32c", "crc64nvme", "sha1", "sha256"])
+def test_multipart_checksum(s3, alg):
+    parts = [os.urandom(PART_SIZE), os.urandom(1000)]
+    create = {"ChecksumAlgorithm": alg.upper()} if alg else {}
+    u, listed = upload(s3, "k", parts, **create)
+    r = complete(s3, "k", u, listed)
+    # The default type of each algorithm, and CRC64NVME by default.
+    alg = alg or "crc64nvme"
+    arg = f"Checksum{alg.upper()}"
+    if alg == "crc64nvme":
+        expected, type = b64(digest(alg, b"".join(parts))), "FULL_OBJECT"
+    else:
+        expected, type = composite(alg, parts), "COMPOSITE"
+    assert (r[arg], r["ChecksumType"]) == (expected, type)
+    h = s3.head_object(Bucket="bkt", Key="k", ChecksumMode="ENABLED")
+    assert (h[arg], h["ChecksumType"]) == (expected, type)
+
+
+@pytest.mark.parametrize("alg, type", [("SHA256", "FULL_OBJECT"), ("CRC64NVME", "COMPOSITE")])
+def test_multipart_invalid_checksum_type(s3, alg, type):
+    expect_error("InvalidRequest", 400, s3.create_multipart_upload, Bucket="bkt", Key="k",
+                 ChecksumAlgorithm=alg, ChecksumType=type)
+
+
+def test_part_checksums(s3):
+    u = s3.create_multipart_upload(Bucket="bkt", Key="k", ChecksumAlgorithm="SHA256")["UploadId"]
+    r = s3.upload_part(Bucket="bkt", Key="k", UploadId=u, PartNumber=1, Body=b"x", ChecksumSHA256=b64(digest("sha256", b"x")))
+    assert r["ChecksumSHA256"] == b64(digest("sha256", b"x"))
+    expect_error("BadDigest", 400, s3.upload_part, Bucket="bkt", Key="k", UploadId=u, PartNumber=1, Body=b"y",
+                 ChecksumSHA256=b64(digest("sha256", b"x")))
+    expect_error("InvalidRequest", 400, s3.upload_part, Bucket="bkt", Key="k", UploadId=u, PartNumber=1, Body=b"x",
+                 ChecksumCRC32=b64(digest("crc32", b"x")))
+    # An upload with the default algorithm takes parts with any checksum.
+    u = s3.create_multipart_upload(Bucket="bkt", Key="k2")["UploadId"]
+    s3.upload_part(Bucket="bkt", Key="k2", UploadId=u, PartNumber=1, Body=b"x", ChecksumCRC32=b64(digest("crc32", b"x")))
+    expect_error("BadDigest", 400, s3.upload_part, Bucket="bkt", Key="k2", UploadId=u, PartNumber=1, Body=b"y",
+                 ChecksumCRC32=b64(digest("crc32", b"x")))
+
+
+@pytest.mark.parametrize("number", [0, 10001])
+def test_part_number_range(s3, number):
+    u = s3.create_multipart_upload(Bucket="bkt", Key="k")["UploadId"]
+    expect_error("InvalidArgument", 400, s3.upload_part, Bucket="bkt", Key="k", UploadId=u, PartNumber=number, Body=b"x")
+
+
+def test_complete_errors(s3):
+    u, listed = upload(s3, "k", [b"a" * PART_SIZE, b"small", b"last"])
+    p1, p2, p3 = listed
+    expect_error("InvalidPartOrder", 400, complete, s3, "k", u, [p2, p1])
+    expect_error("InvalidPartOrder", 400, complete, s3, "k", u, [p1, p1])
+    expect_error("EntityTooSmall", 400, complete, s3, "k", u, [p1, p2, p3])
+    expect_error("InvalidPart", 400, complete, s3, "k", u, [{"PartNumber": 1, "ETag": p2["ETag"]}])
+    expect_error("InvalidPart", 400, complete, s3, "k", u, [{**p1, "ChecksumCRC64NVME": b64(digest("crc64nvme", b"x"))}])
+    expect_error("InvalidRequest", 400, complete, s3, "k", u, [p1, p3], MpuObjectSize=5)
+    # Unquoted ETags are fine too.
+    complete(s3, "k", u, [p1, {"PartNumber": 3, "ETag": p3["ETag"].strip('"')}], MpuObjectSize=PART_SIZE + 4)
+    assert s3.get_object(Bucket="bkt", Key="k")["Body"].read() == b"a" * PART_SIZE + b"last"
+
+
+def test_complete_object_checksum(s3):
+    parts = [os.urandom(PART_SIZE), b"tail"]
+    u, listed = upload(s3, "k", parts)
+    expect_error("BadDigest", 400, complete, s3, "k", u, listed, ChecksumCRC64NVME=b64(digest("crc64nvme", b"x")))
+    complete(s3, "k", u, listed, ChecksumCRC64NVME=b64(digest("crc64nvme", b"".join(parts))))
+
+
+@pytest.mark.parametrize("body", [b"", b"<nope", b"<CompleteMultipartUpload/>",
+                                  b"<CompleteMultipartUpload><Part><ETag>x</ETag></Part></CompleteMultipartUpload>"])
+def test_complete_malformed(s3_url, s3, body):
+    u = s3.create_multipart_upload(Bucket="bkt", Key="k")["UploadId"]
+    r = requests.post(f"{s3_url}/bkt/k", params={"uploadId": u}, data=body)
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "MalformedXML")
+
+
+def test_list_parts(s3):
+    u, _ = upload(s3, "k", [b"1", b"22", b"333", b"4444"], ChecksumAlgorithm="CRC32C")
+    r = s3.list_parts(Bucket="bkt", Key="k", UploadId=u, MaxParts=2)
+    assert [(p["PartNumber"], p["Size"]) for p in r["Parts"]] == [(1, 1), (2, 2)]
+    assert (r["IsTruncated"], r["NextPartNumberMarker"], r["MaxParts"]) == (True, 2, 2)
+    assert r["Parts"][1]["ETag"] == md5_etag(b"22")
+    assert r["Parts"][1]["ChecksumCRC32C"] == b64(digest("crc32c", b"22"))
+    assert (r["ChecksumAlgorithm"], r["ChecksumType"]) == ("CRC32C", "COMPOSITE")
+    r = s3.list_parts(Bucket="bkt", Key="k", UploadId=u, PartNumberMarker=2)
+    assert ([p["PartNumber"] for p in r["Parts"]], r["IsTruncated"]) == ([3, 4], False)
+
+
+def test_abort(s3):
+    u, _ = upload(s3, "k", [b"x"])
+    assert s3.abort_multipart_upload(Bucket="bkt", Key="k", UploadId=u)["ResponseMetadata"]["HTTPStatusCode"] == 204
+    expect_error("NoSuchUpload", 404, s3.abort_multipart_upload, Bucket="bkt", Key="k", UploadId=u)
+
+
+def test_upload_file(s3, tmp_path):
+    # boto3's managed upload: parts of 8 MiB, with CRC32s.
+    data = os.urandom(20 * 1024 * 1024 + 7)
+    path = tmp_path / "data"
+    path.write_bytes(data)
+    s3.upload_file(str(path), "bkt", "k")
+    h = s3.head_object(Bucket="bkt", Key="k", ChecksumMode="ENABLED")
+    assert (h["ContentLength"], h["ChecksumType"]) == (len(data), "COMPOSITE")
+    assert h["ETag"].endswith('-3"')
+    assert s3.get_object(Bucket="bkt", Key="k")["Body"].read() == data
+
+
 # Listing
 
 @pytest.fixture
@@ -290,8 +437,10 @@ def test_error_reply(s3_url, s3):
     ("PUT", "/bkt/k", {"If-None-Match": '"x"'}),
     ("PUT", "/bkt/k", {"x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"}),
     ("PUT", "/bkt/k", {"Content-Encoding": "aws-chunked"}),
-    ("POST", "/bkt/k?uploads", {}),
-    ("PUT", "/bkt/k?partNumber=1&uploadId=x", {}),
+    ("POST", "/bkt/k?uploads", {"x-amz-tagging": "a=b"}),
+    ("POST", "/bkt/k?uploads", {"x-amz-checksum-algorithm": "CRC32", "x-amz-checksum-type": "FULL_OBJECT"}),
+    ("PUT", "/bkt/k?partNumber=1&uploadId=x", {"x-amz-copy-source": "/bkt/src"}),
+    ("GET", "/bkt?uploads", {}),
     ("GET", "/bkt/k", {"If-None-Match": '"x"'}),
     ("GET", "/bkt/k", {"If-Modified-Since": "Wed, 12 Oct 2009 17:50:00 GMT"}),
     ("GET", "/bkt/k?versionId=1", {}),
