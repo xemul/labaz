@@ -357,10 +357,10 @@ public:
 };
 
 class plywood_facade final : public facade {
-    storage& _storage;
+    storage_service& _storage;
 
 public:
-    explicit plywood_facade(storage& s) : _storage(s) {}
+    explicit plywood_facade(storage_service& s) : _storage(s) {}
 
     void set_routes(httpd::routes& r) override {
         using enum httpd::operation_type;
@@ -645,7 +645,7 @@ facade_type make_facade_type() {
         .name = "plywood",
         .description = "Testing-only HTTP/JSON protocol mapping 1:1 to the storage API",
         .add_options = [] (bpo::options_description&) {},
-        .make = [] (const bpo::variables_map&, storage& s) -> std::unique_ptr<facade> {
+        .make = [] (const bpo::variables_map&, storage_service& s) -> std::unique_ptr<facade> {
             return std::make_unique<plywood_facade>(s);
         },
     };

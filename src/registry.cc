@@ -51,13 +51,9 @@ storage_service::storage_service(const backend_type& type, const boost::program_
     _impl->_service = this;
 }
 
-future<> storage_service::stop() {
-    return _impl->stop();
-}
-
 facade_service::facade_service(const facade_type& type, const boost::program_options::variables_map& opts,
                                storage_service& storage)
-    : _impl(type.make(opts, storage.get()))
+    : _impl(type.make(opts, storage))
 {}
 
 future<> facade_service::stop() {

@@ -145,24 +145,21 @@ struct listing {
 
 class storage_service;
 
-/// The storage. There is one instance per shard, and every object belongs
-/// to one shard (see sharder): the calls about an object, and about its
-/// upload sessions, are run on that shard, whatever shard they are made on.
-/// Bucket calls and listing run on the shard they are made on, and the
+/// The interface of a storage backend, used through storage_service. There
+/// is one instance per shard, and every object belongs to one shard (see
+/// sharder): the calls about an object, and about its upload sessions, are
+/// made only on that shard, as storage_service routes them there. Bucket
+/// calls and listing are made on the shard they were called on, and the
 /// backend answers them for all shards: a backend whose shards do not share
 /// their data spreads them over the shards itself (with owner_of() and
-/// invoke_on()), and merges the listings.
+/// invoke_on()), and merges the listings. A backend that needs another
+/// object's shard (as a copy does its source's) reaches it with owner_of()
+/// and invoke_on() as well.
 ///
-/// The public calls do that routing and are the same for every backend.
-/// Backends implement the do_*() calls, each of which is only made on the
-/// shard owning its object. A backend that needs another object's shard
-/// (as a copy does its source's) reaches it with owner_of() and invoke_on().
-///
-/// Keys are non-empty and must not end with '/'.
+/// The calls are those of storage_service, which documents them.
 class storage {
     friend class storage_service;
 
-    sharder _sharder;
     storage_service* _service = nullptr;
 
 public:
@@ -170,6 +167,72 @@ public:
 
     virtual future<> start() = 0;
     virtual future<> stop() = 0;
+
+protected:
+    virtual future<> create_bucket(sstring bucket) = 0;
+    virtual future<> delete_bucket(sstring bucket) = 0;
+    virtual future<std::vector<sstring>> list_buckets() = 0;
+    virtual future<session_id> open_session(sstring bucket, sstring key, object_attrs attrs) = 0;
+    virtual future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                         seastar::input_stream<char>& in) = 0;
+    virtual future<part_info> copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                        sstring src_key, std::optional<byte_range> range, precondition src_pre) = 0;
+    virtual future<session_info> describe_session(sstring bucket, sstring key, session_id id) = 0;
+    virtual future<object_info> commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
+                                               precondition pre) = 0;
+    virtual future<> abort_session(sstring bucket, sstring key, session_id id) = 0;
+    virtual future<object_info> head_object(sstring bucket, sstring key) = 0;
+    virtual future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range) = 0;
+    virtual future<> delete_object(sstring bucket, sstring key) = 0;
+    virtual future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) = 0;
+
+    inline unsigned owner_of(std::string_view bucket, std::string_view key) const;
+
+    // Runs func(storage&) with the storage of the given shard; its result
+    // moves to this shard.
+    template <typename Func>
+    auto invoke_on(unsigned shard, Func func);
+};
+
+/// A backend type, selected with --backend.
+struct backend_type {
+    sstring name;
+    sstring description;
+    // Adds the backend's own command line options.
+    std::function<void(boost::program_options::options_description&)> add_options;
+    // Called on every shard.
+    std::function<std::unique_ptr<storage>(const boost::program_options::variables_map&)> make;
+};
+
+const std::vector<backend_type>& backend_types();
+const backend_type* find_backend_type(std::string_view name);
+
+/// The storage: the shard's instance of the backend, with the calls routed
+/// to the shard owning their object. There is one instance per shard.
+///
+/// Keys are non-empty and must not end with '/'.
+class storage_service : public seastar::peering_sharded_service<storage_service> {
+    friend class storage;
+
+    std::unique_ptr<storage> _impl;
+    sharder _sharder;
+
+    unsigned owner_of(std::string_view bucket, std::string_view key) const {
+        return _sharder.shard_of(bucket, key);
+    }
+
+    template <typename Func>
+    auto invoke_on(unsigned shard, Func func) {
+        return container().invoke_on(shard, [func = std::move(func)] (storage_service& s) mutable {
+            return func(*s._impl);
+        });
+    }
+
+public:
+    storage_service(const backend_type& type, const boost::program_options::variables_map& opts);
+
+    future<> start();
+    future<> stop();
 
     future<> create_bucket(sstring bucket);
     /// Fails with bucket_not_empty if the bucket has objects or sessions.
@@ -204,63 +267,15 @@ public:
     future<> delete_object(sstring bucket, sstring key);
     /// Keys in byte order, starting after `start_after`.
     future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys);
-
-protected:
-    // The calls above, on the right shard.
-    virtual future<> do_create_bucket(sstring bucket) = 0;
-    virtual future<> do_delete_bucket(sstring bucket) = 0;
-    virtual future<std::vector<sstring>> do_list_buckets() = 0;
-    virtual future<session_id> do_open_session(sstring bucket, sstring key, object_attrs attrs) = 0;
-    virtual future<part_info> do_write_part(sstring bucket, sstring key, session_id id, unsigned number,
-                                            seastar::input_stream<char>& in) = 0;
-    virtual future<part_info> do_copy_part(sstring bucket, sstring key, session_id id, unsigned number,
-                                           sstring src_key, std::optional<byte_range> range, precondition src_pre) = 0;
-    virtual future<session_info> do_describe_session(sstring bucket, sstring key, session_id id) = 0;
-    virtual future<object_info> do_commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
-                                                  precondition pre) = 0;
-    virtual future<> do_abort_session(sstring bucket, sstring key, session_id id) = 0;
-    virtual future<object_info> do_head_object(sstring bucket, sstring key) = 0;
-    virtual future<object_reader> do_read_object(sstring bucket, sstring key, std::optional<byte_range> range) = 0;
-    virtual future<> do_delete_object(sstring bucket, sstring key) = 0;
-    virtual future<listing> do_list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) = 0;
-
-    unsigned owner_of(std::string_view bucket, std::string_view key) const {
-        return _sharder.shard_of(bucket, key);
-    }
-
-    // Runs func(storage&) with the storage of the given shard; its result
-    // moves to this shard.
-    template <typename Func>
-    auto invoke_on(unsigned shard, Func func);
 };
 
-/// A backend type, selected with --backend.
-struct backend_type {
-    sstring name;
-    sstring description;
-    // Adds the backend's own command line options.
-    std::function<void(boost::program_options::options_description&)> add_options;
-    // Called on every shard.
-    std::function<std::unique_ptr<storage>(const boost::program_options::variables_map&)> make;
-};
-
-const std::vector<backend_type>& backend_types();
-const backend_type* find_backend_type(std::string_view name);
-
-/// Holds the shard's backend instance.
-class storage_service : public seastar::peering_sharded_service<storage_service> {
-    std::unique_ptr<storage> _impl;
-public:
-    storage_service(const backend_type& type, const boost::program_options::variables_map& opts);
-    storage& get() noexcept { return *_impl; }
-    future<> stop();
-};
+unsigned storage::owner_of(std::string_view bucket, std::string_view key) const {
+    return _service->owner_of(bucket, key);
+}
 
 template <typename Func>
 auto storage::invoke_on(unsigned shard, Func func) {
-    return _service->container().invoke_on(shard, [func = std::move(func)] (storage_service& s) mutable {
-        return func(s.get());
-    });
+    return _service->invoke_on(shard, std::move(func));
 }
 
 } // namespace labaz

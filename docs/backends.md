@@ -1,8 +1,9 @@
 # Storage backends
 
 A backend is selected with `--backend <name>`. Every backend implements the
-`labaz::storage` interface (`src/storage.hh`); facades only talk to that
-interface.
+`labaz::storage` interface (`src/storage.hh`). Facades talk to
+`labaz::storage_service`, which routes the calls about an object to the
+backend instance of the shard owning it.
 
 ## potato
 
@@ -53,10 +54,10 @@ Layout under `<dir>`: an object is a directory named by the SHA-1 of its key.
   data is only read if the session wants checksums that cannot be derived.
   The meta keeps the object's parts (sizes and checksums) besides its
   slices.
-- Every `do_*()` call is made on the shard owning its object (the generic
-  `storage` routes them there; only a copy reaches its source's shard
-  itself), so sessions can live in the memory of the
-  shard that opened them. All shards share the data directory, so a restart
+- Every call about an object is made on the shard owning it
+  (`storage_service` routes them there; only a copy reaches its source's
+  shard itself), so sessions can live in the memory of the shard that
+  opened them. All shards share the data directory, so a restart
   with another number of shards finds every object; only in-progress
   sessions are lost, as on any restart.
 

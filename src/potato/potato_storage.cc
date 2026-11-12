@@ -390,7 +390,7 @@ public:
         co_return;
     }
 
-    future<> do_create_bucket(sstring bucket) override {
+    future<> create_bucket(sstring bucket) override {
         validate_bucket_name(bucket);
         auto dir = bucket_dir(bucket);
         // FIXME: two shards creating the bucket at once can both pass the
@@ -401,7 +401,7 @@ public:
         co_await make_directory(dir.native());
     }
 
-    future<> do_delete_bucket(sstring bucket) override {
+    future<> delete_bucket(sstring bucket) override {
         validate_bucket_name(bucket);
         // FIXME: nothing excludes object calls on other shards, whose locks
         // are their own. A session opened there between the emptiness check
@@ -415,7 +415,7 @@ public:
         co_await recursive_remove_directory(bucket_dir(bucket));
     }
 
-    future<std::vector<sstring>> do_list_buckets() override {
+    future<std::vector<sstring>> list_buckets() override {
         std::vector<sstring> ret;
         auto dir = co_await open_directory(_root.native());
         co_await dir.list_directory([&ret] (directory_entry de) {
@@ -429,7 +429,7 @@ public:
         co_return ret;
     }
 
-    future<session_id> do_open_session(sstring bucket, sstring key, object_attrs attrs) override {
+    future<session_id> open_session(sstring bucket, sstring key, object_attrs attrs) override {
         validate_bucket_name(bucket);
         auto dir = object_dir(bucket, key);
         co_await check_bucket(bucket);
@@ -442,7 +442,7 @@ public:
         co_return id;
     }
 
-    future<part_info> do_write_part(sstring bucket, sstring key, session_id id, unsigned number, input_stream<char>& in) override {
+    future<part_info> write_part(sstring bucket, sstring key, session_id id, unsigned number, input_stream<char>& in) override {
         auto algorithms = active_session(bucket, key, id).attrs.checksums;
         auto final = session_dir(bucket, key, id) / fmt::format("{}{}.{:x}", part_prefix, number, next_unique());
         auto tmp = fs::path(final.native() + ".tmp");
@@ -479,8 +479,8 @@ public:
                                     sealed_part{{slice{final.filename().native(), 0, size}}, size, std::move(sums)});
     }
 
-    future<part_info> do_copy_part(sstring bucket, sstring key, session_id id, unsigned number,
-                                   sstring src_key, std::optional<byte_range> range, precondition src_pre) override {
+    future<part_info> copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                sstring src_key, std::optional<byte_range> range, precondition src_pre) override {
         auto algorithms = active_session(bucket, key, id).attrs.checksums;
         auto dir = session_dir(bucket, key, id);
         // A source of another shard is linked into the staging directory by
@@ -515,7 +515,7 @@ public:
         co_return co_await add_part(bucket, key, id, number, std::move(part));
     }
 
-    future<session_info> do_describe_session(sstring bucket, sstring key, session_id id) override {
+    future<session_info> describe_session(sstring bucket, sstring key, session_id id) override {
         auto& st = active_session(bucket, key, id);
         session_info ret{id, st.bucket, st.key, st.attrs, {}};
         for (auto& [n, p] : st.parts) {
@@ -524,7 +524,7 @@ public:
         co_return ret;
     }
 
-    future<object_info> do_commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> numbers,
+    future<object_info> commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> numbers,
                                        precondition pre) override {
         auto it = _sessions.find(id);
         if (it != _sessions.end() && it->second.committed && it->second.bucket == bucket && it->second.key == key) {
@@ -561,7 +561,7 @@ public:
         co_return *st.committed;
     }
 
-    future<> do_abort_session(sstring bucket, sstring key, session_id id) override {
+    future<> abort_session(sstring bucket, sstring key, session_id id) override {
         active_session(bucket, key, id);
         _sessions.erase(id);
         auto lock = co_await _lock.hold_write_lock();
@@ -569,12 +569,12 @@ public:
         co_await remove_if_empty(object_dir(bucket, key));
     }
 
-    future<object_info> do_head_object(sstring bucket, sstring key) override {
+    future<object_info> head_object(sstring bucket, sstring key) override {
         auto m = co_await load_meta(bucket, key);
         co_return std::move(m.info);
     }
 
-    future<object_reader> do_read_object(sstring bucket, sstring key, std::optional<byte_range> range) override {
+    future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range) override {
         // Once the parts are open, removing them does not affect the reader.
         auto lock = co_await _lock.hold_read_lock();
         auto m = co_await load_meta(bucket, key);
@@ -583,7 +583,7 @@ public:
         co_return object_reader{std::move(m.info), input_stream<char>(std::move(src))};
     }
 
-    future<> do_delete_object(sstring bucket, sstring key) override {
+    future<> delete_object(sstring bucket, sstring key) override {
         auto lock = co_await _lock.hold_write_lock();
         auto m = co_await load_meta(bucket, key);
         auto dir = object_dir(bucket, key);
@@ -592,7 +592,7 @@ public:
         co_await remove_if_empty(dir);
     }
 
-    future<listing> do_list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) override {
+    future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) override {
         validate_bucket_name(bucket);
         co_await check_bucket(bucket);
         // Object directories are named by hashes, so every object's meta is

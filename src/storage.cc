@@ -74,76 +74,84 @@ checksums object_checksums(const object_info& info) {
 
 using namespace seastar;
 
-future<> storage::create_bucket(sstring bucket) {
-    return do_create_bucket(std::move(bucket));
+future<> storage_service::start() {
+    return _impl->start();
 }
 
-future<> storage::delete_bucket(sstring bucket) {
-    return do_delete_bucket(std::move(bucket));
+future<> storage_service::stop() {
+    return _impl->stop();
 }
 
-future<std::vector<sstring>> storage::list_buckets() {
-    return do_list_buckets();
+future<> storage_service::create_bucket(sstring bucket) {
+    return _impl->create_bucket(std::move(bucket));
 }
 
-future<listing> storage::list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) {
-    return do_list_objects(std::move(bucket), std::move(prefix), std::move(start_after), max_keys);
+future<> storage_service::delete_bucket(sstring bucket) {
+    return _impl->delete_bucket(std::move(bucket));
 }
 
-future<session_id> storage::open_session(sstring bucket, sstring key, object_attrs attrs) {
+future<std::vector<sstring>> storage_service::list_buckets() {
+    return _impl->list_buckets();
+}
+
+future<listing> storage_service::list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) {
+    return _impl->list_objects(std::move(bucket), std::move(prefix), std::move(start_after), max_keys);
+}
+
+future<session_id> storage_service::open_session(sstring bucket, sstring key, object_attrs attrs) {
     return invoke_on(owner_of(bucket, key), [bucket, key, attrs = std::move(attrs)] (storage& s) {
-        return s.do_open_session(bucket, key, attrs);
+        return s.open_session(bucket, key, attrs);
     });
 }
 
-future<part_info> storage::write_part(sstring bucket, sstring key, session_id id, unsigned number, input_stream<char>& in) {
+future<part_info> storage_service::write_part(sstring bucket, sstring key, session_id id, unsigned number, input_stream<char>& in) {
     auto owner = owner_of(bucket, key);
     if (owner == this_shard_id()) {
-        return do_write_part(std::move(bucket), std::move(key), std::move(id), number, in);
+        return _impl->write_part(std::move(bucket), std::move(key), std::move(id), number, in);
     }
     // The owner reads `in` from this shard, which waits for it to finish.
     return invoke_on(owner, [bucket, key, id, number, &in, from = this_shard_id()] (storage& s) {
         return do_with(make_foreign_stream(from, in, deleter()), [&s, bucket, key, id, number] (input_stream<char>& foreign) {
-            return s.do_write_part(bucket, key, id, number, foreign);
+            return s.write_part(bucket, key, id, number, foreign);
         });
     });
 }
 
-future<part_info> storage::copy_part(sstring bucket, sstring key, session_id id, unsigned number,
-                                     sstring src_key, std::optional<byte_range> range, precondition src_pre) {
+future<part_info> storage_service::copy_part(sstring bucket, sstring key, session_id id, unsigned number,
+                                             sstring src_key, std::optional<byte_range> range, precondition src_pre) {
     return invoke_on(owner_of(bucket, key), [=] (storage& s) {
-        return s.do_copy_part(bucket, key, id, number, src_key, range, src_pre);
+        return s.copy_part(bucket, key, id, number, src_key, range, src_pre);
     });
 }
 
-future<session_info> storage::describe_session(sstring bucket, sstring key, session_id id) {
+future<session_info> storage_service::describe_session(sstring bucket, sstring key, session_id id) {
     return invoke_on(owner_of(bucket, key), [bucket, key, id] (storage& s) {
-        return s.do_describe_session(bucket, key, id);
+        return s.describe_session(bucket, key, id);
     });
 }
 
-future<object_info> storage::commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
-                                            precondition pre) {
+future<object_info> storage_service::commit_session(sstring bucket, sstring key, session_id id, std::vector<unsigned> parts,
+                                                    precondition pre) {
     return invoke_on(owner_of(bucket, key), [bucket, key, id, parts = std::move(parts), pre] (storage& s) {
-        return s.do_commit_session(bucket, key, id, parts, pre);
+        return s.commit_session(bucket, key, id, parts, pre);
     });
 }
 
-future<> storage::abort_session(sstring bucket, sstring key, session_id id) {
+future<> storage_service::abort_session(sstring bucket, sstring key, session_id id) {
     return invoke_on(owner_of(bucket, key), [bucket, key, id] (storage& s) {
-        return s.do_abort_session(bucket, key, id);
+        return s.abort_session(bucket, key, id);
     });
 }
 
-future<object_info> storage::head_object(sstring bucket, sstring key) {
+future<object_info> storage_service::head_object(sstring bucket, sstring key) {
     return invoke_on(owner_of(bucket, key), [bucket, key] (storage& s) {
-        return s.do_head_object(bucket, key);
+        return s.head_object(bucket, key);
     });
 }
 
-future<> storage::delete_object(sstring bucket, sstring key) {
+future<> storage_service::delete_object(sstring bucket, sstring key) {
     return invoke_on(owner_of(bucket, key), [bucket, key] (storage& s) {
-        return s.do_delete_object(bucket, key);
+        return s.delete_object(bucket, key);
     });
 }
 
@@ -157,13 +165,13 @@ struct parked_reader {
 
 }
 
-future<object_reader> storage::read_object(sstring bucket, sstring key, std::optional<byte_range> range) {
+future<object_reader> storage_service::read_object(sstring bucket, sstring key, std::optional<byte_range> range) {
     auto owner = owner_of(bucket, key);
     if (owner == this_shard_id()) {
-        return do_read_object(std::move(bucket), std::move(key), range);
+        return _impl->read_object(std::move(bucket), std::move(key), range);
     }
     return invoke_on(owner, [bucket, key, range] (storage& s) {
-        return s.do_read_object(bucket, key, range).then([] (object_reader r) {
+        return s.read_object(bucket, key, range).then([] (object_reader r) {
             return parked_reader{std::move(r.info), make_foreign(std::make_unique<input_stream<char>>(std::move(r.data)))};
         });
     }).then([owner] (parked_reader r) {

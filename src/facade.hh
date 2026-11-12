@@ -40,7 +40,7 @@ struct facade_type {
     sstring description;
     std::function<void(boost::program_options::options_description&)> add_options;
     // Called on every shard with that shard's storage.
-    std::function<std::unique_ptr<facade>(const boost::program_options::variables_map&, storage&)> make;
+    std::function<std::unique_ptr<facade>(const boost::program_options::variables_map&, storage_service&)> make;
 };
 
 const std::vector<facade_type>& facade_types();

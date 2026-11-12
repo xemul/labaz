@@ -184,7 +184,7 @@ int main(int ac, char** av) {
             auto stop_storage = defer([&storage] () noexcept {
                 storage.stop().get();
             });
-            storage.invoke_on_all([] (labaz::storage_service& s) { return s.get().start(); }).get();
+            storage.invoke_on_all([] (labaz::storage_service& s) { return s.start(); }).get();
 
             std::list<sharded<labaz::facade_service>> facades;
             std::list<labaz::http_frontend> frontends;
