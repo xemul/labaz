@@ -1,15 +1,14 @@
 # Copyright (C) 2026 The Labaz Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""The storage API through the plywood facade, on the potato backend."""
+"""The storage API through the plywood facade, on the potato backend. What
+every facade does alike is tested in test_objects.py."""
 
 import hashlib
 import os
-import threading
 import zlib
 
 import pytest
-import requests
 
 from conftest import free_port
 from plywood_client import PlywoodClient, PlywoodError
@@ -23,24 +22,8 @@ def expect_error(code: str, status: int, func, *args, **kwargs):
 
 # Buckets
 
-def test_buckets(plywood):
-    plywood.create_bucket("b2")
-    assert plywood.list_buckets() == ["b2", "bkt"]
-    expect_error("bucket_exists", 409, plywood.create_bucket, "b2")
-    plywood.delete_bucket("b2")
-    assert plywood.list_buckets() == ["bkt"]
-    expect_error("no_such_bucket", 404, plywood.delete_bucket, "b2")
-
-
 def test_invalid_bucket_name(plywood):
     expect_error("invalid_argument", 400, plywood.create_bucket, "a%7Eb")
-
-
-def test_delete_non_empty_bucket(plywood):
-    plywood.put("bkt", "k", b"x")
-    expect_error("bucket_not_empty", 409, plywood.delete_bucket, "bkt")
-    plywood.delete("bkt", "k")
-    plywood.delete_bucket("bkt")
 
 
 def test_open_session_makes_bucket_non_empty(plywood):
@@ -50,18 +33,7 @@ def test_open_session_makes_bucket_non_empty(plywood):
     plywood.delete_bucket("bkt")
 
 
-def test_deleted_objects_leave_bucket_empty(plywood):
-    plywood.put("bkt", "a/b/c", b"x")
-    plywood.put("bkt", "/x", b"x")
-    plywood.delete("bkt", "a/b/c")
-    plywood.delete("bkt", "/x")
-    plywood.delete_bucket("bkt")
-
-
-def test_no_such_bucket(plywood):
-    expect_error("no_such_bucket", 404, plywood.put, "nope", "k", b"x")
-    expect_error("no_such_bucket", 404, plywood.read, "nope", "k")
-    expect_error("no_such_bucket", 404, plywood.list, "nope")
+def test_no_such_bucket_for_session(plywood):
     expect_error("no_such_bucket", 404, plywood.open_session, "nope", "k")
 
 
@@ -88,25 +60,10 @@ def test_head(plywood):
     expect_error("", 404, plywood.head, "bkt", "nope")  # HEAD has no body
 
 
-def test_empty_object(plywood):
-    assert plywood.put("bkt", "empty", b"")["size"] == 0
-    assert plywood.read("bkt", "empty") == b""
+def test_empty_session_object(plywood):
     s = plywood.open_session("bkt", "empty2")
     assert plywood.commit("bkt", "empty2", s, [])["size"] == 0
     assert plywood.read("bkt", "empty2") == b""
-
-
-def test_large_object(plywood):
-    data = os.urandom(5 * 1024 * 1024 + 123)
-    plywood.put("bkt", "large", data)
-    assert plywood.read("bkt", "large") == data
-
-
-def test_delete(plywood):
-    plywood.put("bkt", "key", b"x")
-    plywood.delete("bkt", "key")
-    expect_error("no_such_key", 404, plywood.read, "bkt", "key")
-    expect_error("no_such_key", 404, plywood.delete, "bkt", "key")
 
 
 def test_overwrite(plywood):
@@ -134,28 +91,6 @@ def test_generation_unique_after_recreate(plywood):
     assert g2 != g1
 
 
-@pytest.mark.parametrize("rng, expected, content_range", [
-    ("bytes=0-0", b"0", "bytes 0-0/10"),
-    ("bytes=2-5", b"2345", "bytes 2-5/10"),
-    ("bytes=7-", b"789", "bytes 7-9/10"),
-    ("bytes=-3", b"789", "bytes 7-9/10"),
-    ("bytes=-30", b"0123456789", "bytes 0-9/10"),
-    ("bytes=5-100", b"56789", "bytes 5-9/10"),
-])
-def test_range(plywood, rng, expected, content_range):
-    plywood.put("bkt", "key", b"0123456789")
-    r = plywood.get("bkt", "key", range=rng)
-    assert r.status_code == 206
-    assert r.content == expected
-    assert r.headers["Content-Range"] == content_range
-
-
-@pytest.mark.parametrize("rng", ["bytes=10-", "bytes=10-20", "bytes=-0"])
-def test_unsatisfiable_range(plywood, rng):
-    plywood.put("bkt", "key", b"0123456789")
-    expect_error("invalid_range", 416, plywood.read, "bkt", "key", range=rng)
-
-
 def test_bad_range(plywood):
     plywood.put("bkt", "key", b"0123456789")
     expect_error("bad_request", 400, plywood.read, "bkt", "key", range="pages=1-2")
@@ -163,67 +98,10 @@ def test_bad_range(plywood):
 
 # Keys
 
-@pytest.mark.parametrize("key", [
-    "a/b/c",
-    "/leading",
-    "a//b",
-    ".", "..", "./x", "x/../y",
-    "tilde~m", "~e", "per%cent", "sp ace", "q?uery#hash",
-    "ünïcödé",
-    "x" * 1024,
-    "/".join(["y" * 300] * 3),
-])
-def test_key_round_trip(plywood, key):
-    plywood.put("bkt", key, key.encode())
-    assert plywood.read("bkt", key) == key.encode()
-    assert plywood.list_keys("bkt") == [key]
-    plywood.delete("bkt", key)
-    assert plywood.list_keys("bkt") == []
-
-
 @pytest.mark.parametrize("key", ["dir/", "a/b/"])
-def test_key_ending_with_slash(plywood, key):
-    expect_error("invalid_argument", 400, plywood.put, "bkt", key, b"x")
+def test_session_key_ending_with_slash(plywood, key):
     expect_error("invalid_argument", 400, plywood.open_session, "bkt", key)
     assert plywood.list_keys("bkt") == []
-
-
-def test_file_and_directory_keys_coexist(plywood):
-    for k in ["a", "a/b", "a/b/c"]:
-        plywood.put("bkt", k, k.encode())
-    for k in ["a", "a/b", "a/b/c"]:
-        assert plywood.read("bkt", k) == k.encode()
-
-
-def test_flat_namespace(plywood):
-    plywood.put("bkt", "sstables/x/data", b"1")
-    plywood.delete("bkt", "sstables/x/data")
-    assert plywood.list_keys("bkt") == []
-    plywood.put("bkt", "sstables/x/index", b"2")
-    assert plywood.read("bkt", "sstables/x/index") == b"2"
-
-
-def test_list_order_and_prefix(plywood):
-    keys = ["a", "a/b", "a/c", "a.b", "a0", "ab", "b", "a-", "a/b/c", "~", "%", "a//x"]
-    for k in keys:
-        plywood.put("bkt", k, b"")
-    assert plywood.list_keys("bkt") == sorted(keys, key=lambda k: k.encode())
-    assert plywood.list_keys("bkt", prefix="a/") == ["a//x", "a/b", "a/b/c", "a/c"]
-    assert plywood.list_keys("bkt", prefix="a/b") == ["a/b", "a/b/c"]
-    assert plywood.list_keys("bkt", prefix="zzz") == []
-
-
-def test_list_pagination(plywood):
-    keys = sorted(f"{d}/{i:02}" for d in ["x", "y", "z"] for i in range(7))
-    for k in keys:
-        plywood.put("bkt", k, b"")
-    for page in [1, 2, 5, 100]:
-        assert plywood.list_keys("bkt", page=page) == keys
-    r = plywood.list("bkt", start_after="y/03", max_keys=2)
-    assert [o["key"] for o in r["objects"]] == ["y/04", "y/05"]
-    assert r["truncated"]
-    r = plywood.list("bkt", start_after="z/06")
-    assert r["objects"] == [] and not r["truncated"]
 
 
 def test_list_reports_object_info(plywood):
@@ -732,38 +610,6 @@ def test_unknown_route(plywood):
 
 def test_empty_bucket_in_path(plywood):
     expect_error("bad_request", 400, plywood.request, "POST", "/")
-
-
-# Concurrency and sharding
-
-def test_overwrite_under_reads(plywood):
-    """A reader sees either version, never a mix or an error."""
-    a, b = b"a" * 100_000, b"b" * 50_000
-    plywood.put("bkt", "obj", a)
-    stop = threading.Event()
-    errors = []
-
-    def reader():
-        c = PlywoodClient(plywood.url)
-        while not stop.is_set():
-            try:
-                data = c.read("bkt", "obj")
-                if data not in (a, b):
-                    errors.append(f"bad content of length {len(data)}")
-            except Exception as e:
-                errors.append(repr(e))
-
-    threads = [threading.Thread(target=reader) for _ in range(4)]
-    for t in threads:
-        t.start()
-    try:
-        for i in range(50):
-            plywood.put("bkt", "obj", a if i % 2 else b)
-    finally:
-        stop.set()
-        for t in threads:
-            t.join()
-    assert errors == []
 
 
 # Persistence

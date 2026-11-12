@@ -7,12 +7,11 @@ from urllib.parse import quote
 
 import requests
 
+from facade_error import FacadeError
 
-class PlywoodError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(f"{status} {code}: {message}")
-        self.status = status
-        self.code = code
+
+class PlywoodError(FacadeError):
+    pass
 
 
 class PlywoodClient:

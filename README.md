@@ -4,8 +4,9 @@ An object storage server that speaks the S3 and GCS protocols, built on
 [Seastar](https://github.com/scylladb/seastar). See
 [object-storage-design.md](object-storage-design.md) for the design.
 
-At this stage it serves only the testing-only [plywood facade](docs/plywood-protocol.md)
-on top of the [potato backend](docs/backends.md).
+At this stage it serves a part of the [S3 API](docs/s3-protocol.md) and the
+testing-only [plywood facade](docs/plywood-protocol.md), on top of the
+[potato backend](docs/backends.md).
 
 ## Building
 
@@ -52,7 +53,7 @@ ninja -C build/dev check
 python3 -m pytest test --labaz=build/dev/labaz
 ```
 
-They need `pytest`, `requests` and the `openssl` command.
+They need `pytest`, `requests`, `boto3` and the `openssl` command.
 
 ## Layout
 
@@ -66,6 +67,7 @@ They need `pytest`, `requests` and the `openssl` command.
 | `src/registry.cc` | The list of built-in backends and facades |
 | `src/potato/` | The potato backend |
 | `src/plywood/` | The plywood facade |
+| `src/s3/` | The S3 facade; see [docs/s3-protocol.md](docs/s3-protocol.md) |
 | `src/http_frontend.*` | Per-facade HTTP(S) servers on all shards |
 
 ## License

@@ -160,3 +160,32 @@ def plywood(http_url):
     c = PlywoodClient(http_url)
     c.create_bucket("bkt")
     return c
+
+
+@pytest.fixture(params=["plywood", "s3"])
+def client(request, run_labaz):
+    """A client of a fresh server, through each facade in turn (see
+    facades.py), with a bucket named 'bkt' created."""
+    from facades import make_client
+    port = free_port()
+    run_labaz(["--facade", f"{request.param}:http={port}"])
+    c = make_client(request.param, f"http://127.0.0.1:{port}")
+    c.create_bucket("bkt")
+    return c
+
+
+@pytest.fixture
+def s3_url(run_labaz) -> str:
+    port = free_port()
+    run_labaz(["--facade", f"s3:http={port}"])
+    return f"http://127.0.0.1:{port}"
+
+
+@pytest.fixture
+def s3(s3_url):
+    """A boto3 client of a fresh server's s3 facade, with a bucket named
+    'bkt' created."""
+    from facades import s3_client
+    c = s3_client(s3_url)
+    c.create_bucket(Bucket="bkt")
+    return c
