@@ -342,6 +342,9 @@ def test_compose_errors(gcs_url, gcs):
     assert error_of(r) == (404, "notFound")
     r = requests.post(url, json={"sourceObjects": [{"name": "a", "generation": str(b.generation)}]})
     assert r.status_code == 200
+    # A null destination is none, as ScyllaDB sends it.
+    r = requests.post(url, json={"sourceObjects": [{"name": "a"}], "destination": None})
+    assert (r.status_code, r.json().get("metadata")) == (200, None)
     assert error_of(requests.post(url, json={"sourceObjects": []})) == (400, "required")
     assert error_of(requests.post(url, json={"sourceObjects": [{"name": "a"}] * 33})) == (400, "invalid")
 

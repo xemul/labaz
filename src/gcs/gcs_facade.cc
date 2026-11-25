@@ -913,7 +913,7 @@ private:
         // Of the destination's resource only the metadata is used: clients
         // send what they know of the object, its old checksums included.
         object_resource res;
-        if (auto it = doc.FindMember("destination"); it != doc.MemberEnd()) {
+        if (auto it = doc.FindMember("destination"); it != doc.MemberEnd() && !it->value.IsNull()) {
             res = to_object_resource(it->value);
         }
         // A source's generation, given or required, is that it must have.
