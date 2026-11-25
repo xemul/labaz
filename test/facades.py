@@ -32,12 +32,17 @@ class Object:
 
 
 def s3_client(url: str, **config) -> "botocore.client.S3":
-    """A boto3 client of the s3 facade at `url`. Requests are not signed
-    with real credentials, as the facade does not check them, and are not
-    retried."""
+    """A boto3 client of the s3 facade at `url`. Requests are signed with
+    the key labaz:labaz, which servers that check signatures are given, and
+    are not retried."""
     cfg = {"s3": {"addressing_style": "path"}, "retries": {"total_max_attempts": 1}} | config
     return boto3.client("s3", endpoint_url=url, aws_access_key_id="labaz", aws_secret_access_key="labaz",
                         region_name="us-east-1", config=Config(**cfg))
+
+
+# The key the s3 facade's test servers check signatures against, as
+# --s3-key, and that s3_client() signs with.
+S3_KEY = "labaz:labaz"
 
 
 # Storage error codes as (code, status) of the plywood facade.

@@ -16,6 +16,8 @@
 
 #include <pugixml.hpp>
 
+#include <gnutls/crypto.h>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/coroutine/as_future.hh>
@@ -183,12 +185,12 @@ static std::optional<sstring> from_base64(std::string_view s) {
     return sstring(ret);
 }
 
-// Percent-encodes everything but the unreserved characters and '/', as S3
-// does for encoding-type=url.
-static sstring url_encode(std::string_view s) {
+// Percent-encodes everything but the unreserved characters and, unless
+// told otherwise, '/', as S3 does for encoding-type=url and SigV4 does.
+static sstring url_encode(std::string_view s, bool keep_slash = true) {
     std::string ret;
     for (unsigned char c : s) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || (c == '/' && keep_slash)) {
             ret += char(c);
         } else {
             ret += fmt::format("%{:02X}", c);
@@ -944,16 +946,264 @@ struct list_result {
 };
 
 //
+// Authentication
+//
+
+// The keys requests must be signed with (SigV4), and the region they must
+// be signed for. Without keys, requests are not authenticated.
+struct auth_config {
+    std::map<sstring, sstring> keys; // access key -> secret
+    sstring region;                  // empty for any
+};
+
+static constexpr std::string_view sigv4_algorithm = "AWS4-HMAC-SHA256";
+static constexpr auto max_clock_skew = std::chrono::minutes(15);
+
+static s3_error malformed_authorization(std::string_view what) {
+    return s3_error(status::bad_request, "AuthorizationHeaderMalformed",
+                    fmt::format("The authorization header is malformed; {}", what));
+}
+
+static sstring hex_sha256(std::string_view data) {
+    char digest[32];
+    if (gnutls_hash_fast(GNUTLS_DIG_SHA256, data.data(), data.size(), digest) < 0) {
+        throw std::runtime_error("cannot hash");
+    }
+    return to_hex(std::string_view(digest, sizeof(digest)));
+}
+
+static std::string hmac_sha256(std::string_view key, std::string_view data) {
+    std::string ret(32, '\0');
+    if (gnutls_hmac_fast(GNUTLS_MAC_SHA256, key.data(), key.size(), data.data(), data.size(), ret.data()) < 0) {
+        throw std::runtime_error("cannot compute an HMAC");
+    }
+    return ret;
+}
+
+static bool equals_in_constant_time(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
+}
+
+// Splits on any of the separators, dropping empty pieces.
+static std::vector<std::string_view> split(std::string_view s, std::string_view separators) {
+    std::vector<std::string_view> ret;
+    while (!s.empty()) {
+        auto pos = s.find_first_of(separators);
+        if (pos) {
+            ret.push_back(s.substr(0, pos));
+        }
+        if (pos == std::string_view::npos) {
+            break;
+        }
+        s.remove_prefix(pos + 1);
+    }
+    return ret;
+}
+
+// The Authorization header of a SigV4-signed request:
+// "AWS4-HMAC-SHA256 Credential=<key>/<date>/<region>/<service>/aws4_request,
+// SignedHeaders=<name>;<name>..., Signature=<hex>", where the entries may be
+// separated by commas, spaces or both. The views point into `header`.
+struct sigv4_authorization {
+    std::string_view access_key;
+    std::string_view date;
+    std::string_view region;
+    std::string_view service;
+    std::string_view signed_headers;
+    std::string_view signature;
+};
+
+static sigv4_authorization parse_authorization(std::string_view header) {
+    if (header.starts_with("AWS ")) {
+        throw not_implemented("Signature Version 2");
+    }
+    if (!header.starts_with(sigv4_algorithm) || header.substr(sigv4_algorithm.size(), 1) != " ") {
+        throw invalid_argument("Unsupported Authorization Type");
+    }
+    sigv4_authorization ret;
+    std::string_view credential;
+    for (auto entry : split(header.substr(sigv4_algorithm.size()), ", ")) {
+        auto eq = entry.find('=');
+        auto name = entry.substr(0, eq);
+        auto value = eq == std::string_view::npos ? std::string_view() : entry.substr(eq + 1);
+        if (name == "Credential") {
+            credential = value;
+        } else if (name == "SignedHeaders") {
+            ret.signed_headers = value;
+        } else if (name == "Signature") {
+            ret.signature = value;
+        }
+    }
+    if (credential.empty() || ret.signed_headers.empty() || ret.signature.empty()) {
+        throw malformed_authorization("it must have a Credential, SignedHeaders and a Signature.");
+    }
+    auto scope = split(credential, "/");
+    if (scope.size() != 5 || scope[4] != "aws4_request" || credential.ends_with('/')) {
+        throw malformed_authorization(fmt::format("the Credential is mal-formed; expecting "
+                                                  "\"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\"."));
+    }
+    ret.access_key = scope[0];
+    ret.date = scope[1];
+    ret.region = scope[2];
+    ret.service = scope[3];
+    return ret;
+}
+
+// "20091012T175030Z"
+static std::optional<clock_type::time_point> parse_amz_date(const sstring& s) {
+    struct tm tm = {};
+    auto end = strptime(s.c_str(), "%Y%m%dT%H%M%SZ", &tm);
+    if (!end || *end != '\0' || s.size() != 16) {
+        return std::nullopt;
+    }
+    return clock_type::from_time_t(timegm(&tm));
+}
+
+// The path, decoded and encoded again as SigV4 does, keeping '/'.
+static sstring canonical_uri(const request& req) {
+    auto path = url_path(req);
+    sstring decoded;
+    if (!http::internal::path_decode(path, decoded)) {
+        decoded = sstring(path);
+    }
+    return decoded.empty() ? sstring("/") : url_encode(decoded);
+}
+
+// The query parameters, decoded and encoded again as SigV4 does, sorted.
+static sstring canonical_query(const request& req) {
+    std::string_view url = req._url;
+    auto q = url.find('?');
+    if (q == std::string_view::npos) {
+        return "";
+    }
+    std::vector<std::pair<sstring, sstring>> params;
+    for (auto param : split(url.substr(q + 1), "&")) {
+        auto eq = param.find('=');
+        auto encoded = [] (std::string_view s) {
+            sstring decoded;
+            return url_encode(http::internal::url_decode(s, decoded) ? std::string_view(decoded) : s, false);
+        };
+        params.emplace_back(encoded(param.substr(0, eq)),
+                            encoded(eq == std::string_view::npos ? std::string_view() : param.substr(eq + 1)));
+    }
+    std::ranges::sort(params);
+    std::string ret;
+    for (auto& [name, value] : params) {
+        if (!ret.empty()) {
+            ret += '&';
+        }
+        ret += fmt::format("{}={}", name, value);
+    }
+    return sstring(ret);
+}
+
+// The signed headers' names and values, trimmed and with runs of spaces
+// collapsed, one "name:value" per line.
+static sstring canonical_headers(const request& req, std::string_view signed_headers) {
+    std::string ret;
+    for (auto name : split(signed_headers, ";")) {
+        std::string value;
+        for (auto word : split(req.get_header(sstring(name)), " \t")) {
+            if (!value.empty()) {
+                value += ' ';
+            }
+            value += word;
+        }
+        ret += fmt::format("{}:{}\n", name, value);
+    }
+    return sstring(ret);
+}
+
+// Checks the request's SigV4 signature. Returns the SHA-256 of the body
+// that the signature covers, if it covers one, which is for the body's
+// reader to check.
+static std::optional<sstring> authenticate(const request& req, const auth_config& cfg) {
+    if (req.has_query_param("X-Amz-Algorithm") || req.has_query_param("X-Amz-Signature")
+            || req.has_query_param("AWSAccessKeyId")) {
+        throw not_implemented("A presigned URL");
+    }
+    auto header = req.get_header("Authorization");
+    if (header.empty()) {
+        throw s3_error(status::forbidden, "AccessDenied", "Access Denied");
+    }
+    auto auth = parse_authorization(header);
+    if (req._headers.contains("x-amz-security-token")) {
+        throw not_implemented("The x-amz-security-token header");
+    }
+    auto key = cfg.keys.find(sstring(auth.access_key));
+    if (key == cfg.keys.end()) {
+        throw s3_error(status::forbidden, "InvalidAccessKeyId",
+                       "The AWS Access Key Id you provided does not exist in our records.");
+    }
+    if (auth.service != "s3") {
+        throw malformed_authorization(fmt::format("the service '{}' is wrong; expecting 's3'", auth.service));
+    }
+    if (!cfg.region.empty() && auth.region != cfg.region) {
+        throw malformed_authorization(fmt::format("the region '{}' is wrong; expecting '{}'", auth.region, cfg.region));
+    }
+    auto amz_date = req.get_header("x-amz-date");
+    auto time = parse_amz_date(amz_date);
+    if (!time) {
+        throw s3_error(status::forbidden, "AccessDenied", "AWS authentication requires a valid Date or x-amz-date header");
+    }
+    auto now = clock_type::now();
+    if (*time < now - max_clock_skew || *time > now + max_clock_skew) {
+        throw s3_error(status::forbidden, "RequestTimeTooSkewed",
+                       "The difference between the request time and the current time is too large.");
+    }
+    if (auth.date != std::string_view(amz_date).substr(0, 8)) {
+        throw malformed_authorization("Invalid credential date. Date is not the same as X-Amz-Date.");
+    }
+    auto payload = req.get_header("x-amz-content-sha256");
+    if (payload.empty()) {
+        throw invalid_request("Missing required header for this request: x-amz-content-sha256");
+    }
+    if (payload.starts_with("STREAMING-")) {
+        throw not_implemented("An aws-chunked request body");
+    }
+    std::optional<sstring> body_hash;
+    if (payload != "UNSIGNED-PAYLOAD") {
+        body_hash = from_hex(payload);
+        if (!body_hash || body_hash->size() != 32) {
+            throw invalid_argument("x-amz-content-sha256 must be UNSIGNED-PAYLOAD, a STREAMING- value "
+                                   "or a valid sha256 value.");
+        }
+    }
+
+    auto canonical_request = fmt::format("{}\n{}\n{}\n{}\n{}\n{}", req._method, canonical_uri(req), canonical_query(req),
+                                         canonical_headers(req, auth.signed_headers), auth.signed_headers, payload);
+    auto scope = fmt::format("{}/{}/{}/aws4_request", auth.date, auth.region, auth.service);
+    auto string_to_sign = fmt::format("{}\n{}\n{}\n{}", sigv4_algorithm, amz_date, scope, hex_sha256(canonical_request));
+    auto signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(fmt::format("AWS4{}", key->second), auth.date),
+                                                           auth.region), auth.service), "aws4_request");
+    auto signature = to_hex(hmac_sha256(signing_key, string_to_sign));
+    if (!equals_in_constant_time(signature, auth.signature)) {
+        throw s3_error(status::forbidden, "SignatureDoesNotMatch",
+                       "The request signature we calculated does not match the signature you provided. "
+                       "Check your key and signing method.");
+    }
+    return body_hash;
+}
+
+//
 // Handlers
 //
 
-// Runs a request and renders errors as S3 error replies.
+// Authenticates and runs a request, and renders errors as S3 error replies.
 class s3_handler final : public httpd::handler_base {
 public:
     using func_type = std::function<future<std::unique_ptr<reply>>(request&, std::unique_ptr<reply>)>;
 
 private:
     func_type _func;
+    const auth_config& _auth;
 
     static sstring next_request_id() {
         static thread_local uint64_t counter = 0;
@@ -978,12 +1228,26 @@ private:
     }
 
 public:
-    explicit s3_handler(func_type func) : _func(std::move(func)) {}
+    s3_handler(func_type func, const auth_config& auth) : _func(std::move(func)), _auth(auth) {}
 
     future<std::unique_ptr<reply>> handle(const sstring&, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
         auto id = next_request_id();
+        // The body the signature covers, checked as it is read.
+        std::optional<input_stream<char>> signed_body;
         std::exception_ptr ex;
         try {
+            if (!_auth.keys.empty()) {
+                if (auto hash = authenticate(*req, _auth)) {
+                    signed_body = make_checksumming_stream(*req->content_stream, {checksum_algorithm::sha256},
+                            [expected = std::move(*hash)] (checksums sums) {
+                        if (sums[checksum_algorithm::sha256] != expected) {
+                            throw s3_error(status::bad_request, "XAmzContentSHA256Mismatch",
+                                           "The provided 'x-amz-content-sha256' header does not match what was computed.");
+                        }
+                    });
+                    req->content_stream = &*signed_body;
+                }
+            }
             auto ret = co_await _func(*req, std::move(rep));
             ret->add_header("x-amz-request-id", id);
             co_return ret;
@@ -1009,9 +1273,10 @@ public:
 
 class s3_facade final : public facade {
     storage_service& _storage;
+    auth_config _auth;
 
 public:
-    explicit s3_facade(storage_service& s) : _storage(s) {}
+    s3_facade(storage_service& s, auth_config auth) : _storage(s), _auth(std::move(auth)) {}
 
     void set_routes(httpd::routes& r) override {
         using enum httpd::operation_type;
@@ -1039,7 +1304,7 @@ private:
     s3_handler* handler(method m) {
         return new s3_handler([this, m] (request& req, std::unique_ptr<reply> rep) {
             return (this->*m)(req, std::move(rep));
-        });
+        }, _auth);
     }
 
     httpd::match_rule* bucket_rule(method m) {
@@ -1825,9 +2090,29 @@ facade_type make_facade_type() {
     return facade_type{
         .name = "s3",
         .description = "The Amazon S3 REST API, path-style; see docs/s3-protocol.md for what is supported",
-        .add_options = [] (bpo::options_description&) {},
-        .make = [] (const bpo::variables_map&, storage_service& s) -> std::unique_ptr<facade> {
-            return std::make_unique<s3_facade>(s);
+        .add_options = [] (bpo::options_description& opts) {
+            opts.add_options()
+                ("s3-key", bpo::value<std::vector<std::string>>(),
+                    "An access key that requests may be signed with (SigV4), as <access-key>:<secret>; may be given "
+                    "several times. Without any, requests are not authenticated")
+                ("s3-region", bpo::value<std::string>(),
+                    "The region that requests must be signed for; any if not given");
+        },
+        .make = [] (const bpo::variables_map& opts, storage_service& s) -> std::unique_ptr<facade> {
+            auth_config auth;
+            if (opts.contains("s3-key")) {
+                for (auto& k : opts["s3-key"].as<std::vector<std::string>>()) {
+                    auto colon = k.find(':');
+                    if (colon == 0 || colon == std::string::npos || colon + 1 == k.size()) {
+                        throw std::invalid_argument(fmt::format("--s3-key {} is not <access-key>:<secret>", k));
+                    }
+                    auth.keys[sstring(k.substr(0, colon))] = sstring(k.substr(colon + 1));
+                }
+            }
+            if (opts.contains("s3-region")) {
+                auth.region = opts["s3-region"].as<std::string>();
+            }
+            return std::make_unique<s3_facade>(s, std::move(auth));
         },
     };
 }

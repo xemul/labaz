@@ -7,9 +7,36 @@ as S3 does; this page lists what is supported so far and where Labaz differs.
 A request for something that is not supported fails with
 `501 NotImplemented`, rather than being served differently from S3.
 
-Requests are not authenticated: the `Authorization` header and the
-`x-amz-content-sha256` value are not checked, so any client credentials
-work.
+## Authentication
+
+`--s3-key <access-key>:<secret>`, which may be given several times, makes
+the facade check requests' Signature Version 4 `Authorization` header
+against those keys; every key may do everything. Without it, requests are
+not authenticated and any client credentials work. `--s3-region <name>`
+makes requests signed for another region fail with
+`AuthorizationHeaderMalformed`; without it, any region goes.
+
+- The entries of `Authorization` may be separated by commas, spaces or
+  both. The signature covers the request's path and query, decoded and
+  encoded again as SigV4 does, and the headers it lists.
+- `x-amz-date` must be within 15 minutes of the server's clock
+  (`RequestTimeTooSkewed`) and on the date of the credential.
+- `x-amz-content-sha256` is required (`InvalidRequest`). With the SHA-256
+  of the body, the body is checked against it as it is read
+  (`XAmzContentSHA256Mismatch`); `UNSIGNED-PAYLOAD` leaves it unchecked.
+
+| Failure | Status | Code |
+|---|---|---|
+| no `Authorization` header, or no valid `x-amz-date` | 403 | `AccessDenied` |
+| an unknown access key | 403 | `InvalidAccessKeyId` |
+| a wrong signature | 403 | `SignatureDoesNotMatch` |
+| an `Authorization` that does not parse, or of a wrong region or service | 400 | `AuthorizationHeaderMalformed` |
+| an authorization type other than AWS4-HMAC-SHA256 | 400 | `InvalidArgument` |
+
+Signature Version 2, presigned URLs (of either version), `x-amz-security-token`
+(temporary credentials) and aws-chunked bodies fail with `NotImplemented`.
+
+## Errors
 
 Errors are S3's XML documents, with S3's codes and messages:
 
@@ -170,7 +197,8 @@ in byte order. Entries have `Key`, `LastModified`, `ETag`, `Size`,
 
 ## Not supported yet
 
-- Authentication (SigV4) and aws-chunked request bodies.
+- Signature Version 2, presigned URLs, temporary credentials and aws-chunked
+  request bodies.
 - Copying from another bucket.
 - ListMultipartUploads: the storage does not list sessions.
 - Object tagging.

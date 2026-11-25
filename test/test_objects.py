@@ -13,7 +13,7 @@ import pytest
 
 from conftest import free_port
 from facade_error import FacadeError
-from facades import FACADES, PART_SIZE, make_client
+from facades import FACADES, PART_SIZE, S3_KEY, make_client
 from test_plywood import digest
 
 
@@ -93,9 +93,11 @@ def test_head_error_has_no_body(client):
         while chunk := s.recv(65536):
             data += chunk
     head, _, rest = data.partition(b"\r\n\r\n")
-    assert head.startswith(b"HTTP/1.1 404 ")
+    # 404, or 403 from a facade that wants requests signed.
+    status = head.split()[1]
+    assert status in (b"403", b"404")
     # The reply to GET follows the headers of the reply to HEAD.
-    assert rest.startswith(b"HTTP/1.1 404 ")
+    assert rest.startswith(b"HTTP/1.1 " + status + b" ")
 
 
 def test_empty_object(client):
@@ -479,7 +481,10 @@ def test_overwrite_under_reads(client):
 @pytest.mark.parametrize("facade", FACADES)
 def test_objects_survive_restart(run_labaz, tmp_path, facade):
     port = free_port()
-    server = run_labaz(["--facade", f"{facade}:http={port}", "--data-dir", str(tmp_path / "data")])
+    args = ["--facade", f"{facade}:http={port}", "--data-dir", str(tmp_path / "data")]
+    if facade == "s3":
+        args += ["--s3-key", S3_KEY]
+    server = run_labaz(args)
     c = make_client(facade, f"http://127.0.0.1:{port}")
     c.create_bucket("bkt")
     c.put("bkt", "a/b", b"payload", metadata={"m": "v"})

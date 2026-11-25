@@ -166,26 +166,44 @@ def plywood(http_url):
 def client(request, run_labaz):
     """A client of a fresh server, through each facade in turn (see
     facades.py), with a bucket named 'bkt' created."""
-    from facades import make_client
+    from facades import S3_KEY, make_client
     port = free_port()
-    run_labaz(["--facade", f"{request.param}:http={port}"])
+    args = ["--facade", f"{request.param}:http={port}"]
+    if request.param == "s3":
+        args += ["--s3-key", S3_KEY]
+    run_labaz(args)
     c = make_client(request.param, f"http://127.0.0.1:{port}")
     c.create_bucket("bkt")
     return c
 
 
-@pytest.fixture
-def s3_url(run_labaz) -> str:
+def start_s3(run_labaz, *args: str) -> str:
     port = free_port()
-    run_labaz(["--facade", f"s3:http={port}"])
+    run_labaz(["--facade", f"s3:http={port}", *args])
     return f"http://127.0.0.1:{port}"
 
 
 @pytest.fixture
-def s3(s3_url):
+def s3_url(run_labaz) -> str:
+    """The URL of a fresh server's s3 facade that does not check signatures,
+    for tests that send raw HTTP requests."""
+    return start_s3(run_labaz)
+
+
+@pytest.fixture
+def signed_s3_url(run_labaz) -> str:
+    """The URL of a fresh server's s3 facade that checks that requests are
+    signed with S3_KEY, as boto3 clients of facades.s3_client() sign them."""
+    from facades import S3_KEY
+    return start_s3(run_labaz, "--s3-key", S3_KEY)
+
+
+@pytest.fixture
+def s3(request):
     """A boto3 client of a fresh server's s3 facade, with a bucket named
-    'bkt' created."""
+    'bkt' created. The server checks the requests' signatures, unless the
+    test sends raw HTTP requests too: then it is s3_url's server."""
     from facades import s3_client
-    c = s3_client(s3_url)
+    c = s3_client(request.getfixturevalue("s3_url" if "s3_url" in request.fixturenames else "signed_s3_url"))
     c.create_bucket(Bucket="bkt")
     return c

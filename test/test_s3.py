@@ -11,11 +11,14 @@ import hashlib
 import os
 import xml.etree.ElementTree as ET
 
+import boto3
 import botocore
 import pytest
+from botocore.config import Config
 import requests
 
-from facades import PART_SIZE, s3_client
+from conftest import free_port
+from facades import PART_SIZE, S3_KEY, s3_client
 from test_plywood import digest
 
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
@@ -217,9 +220,9 @@ def test_checksum_algorithm_computed(s3):
     assert r["ChecksumSHA256"] == b64(digest("sha256", data))
 
 
-def test_default_checksum(s3_url):
+def test_default_checksum(signed_s3_url):
     # A client that does not send checksums gets S3's default one.
-    s3 = s3_client(s3_url, request_checksum_calculation="when_required", response_checksum_validation="when_required")
+    s3 = s3_client(signed_s3_url, request_checksum_calculation="when_required", response_checksum_validation="when_required")
     s3.create_bucket(Bucket="bkt")
     data = b"payload"
     r = s3.put_object(Bucket="bkt", Key="k", Body=data)
@@ -756,6 +759,136 @@ def test_list_raw_xml(s3_url, s3, tree):
 def test_list_bad_params(s3_url, s3, params):
     r = requests.get(f"{s3_url}/bkt", params=params)
     assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "InvalidArgument")
+
+
+# Authentication (SigV4)
+
+@pytest.fixture
+def auth_url(run_labaz) -> str:
+    """A server that wants requests signed with one of two keys, for
+    us-east-1."""
+    port = free_port()
+    run_labaz(["--facade", f"s3:http={port}", "--s3-key", S3_KEY, "--s3-key", "other:se/cr+et",
+               "--s3-region", "us-east-1"])
+    url = f"http://127.0.0.1:{port}"
+    s3_client(url).create_bucket(Bucket="bkt")
+    return url
+
+
+def error_of(r: requests.Response) -> tuple[int, str]:
+    return r.status_code, ET.fromstring(r.content).find("Code").text
+
+
+def auth_client(url: str, key: str = "labaz", secret: str = "labaz", region: str = "us-east-1", **config):
+    cfg = {"s3": {"addressing_style": "path"}, "retries": {"total_max_attempts": 1}} | config
+    return boto3.client("s3", endpoint_url=url, aws_access_key_id=key, aws_secret_access_key=secret,
+                        region_name=region, config=Config(**cfg))
+
+
+def after_signing(c, operation: str, change):
+    """Makes the client change its requests of the operation after signing
+    them: change(request) gets the AWSPreparedRequest about to be sent."""
+    c.meta.events.register(f"before-send.s3.{operation}", lambda request, **kwargs: change(request))
+
+
+def test_auth(auth_url):
+    """Requests signed with either key pass."""
+    for key, secret in [("labaz", "labaz"), ("other", "se/cr+et")]:
+        c = auth_client(auth_url, key, secret)
+        c.put_object(Bucket="bkt", Key=f"{key}/a b+c", Body=b"data")
+        assert c.get_object(Bucket="bkt", Key=f"{key}/a b+c")["Body"].read() == b"data"
+        r = c.list_objects_v2(Bucket="bkt", Prefix=f"{key}/", StartAfter="", MaxKeys=10)
+        assert [o["Key"] for o in r["Contents"]] == [f"{key}/a b+c"]
+
+
+def test_auth_comma_separated(auth_url):
+    """The Authorization entries may be separated by commas only, as
+    ScyllaDB's client separates them."""
+    c = auth_client(auth_url)
+
+    def change(request):
+        request.headers["Authorization"] = request.headers["Authorization"].replace(b", ", b",")
+    after_signing(c, "PutObject", change)
+    c.put_object(Bucket="bkt", Key="k", Body=b"x")
+
+
+def test_auth_unsigned_payload(auth_url):
+    c = auth_client(auth_url, s3={"addressing_style": "path", "payload_signing_enabled": False})
+    sent = []
+    after_signing(c, "PutObject", lambda request: sent.append(request.headers["x-amz-content-sha256"]))
+    c.put_object(Bucket="bkt", Key="k", Body=b"x")
+    assert sent == [b"UNSIGNED-PAYLOAD"]
+
+
+def test_auth_payload_mismatch(auth_url):
+    """A body other than the signed one fails, and is not stored."""
+    c = auth_client(auth_url)
+
+    def change(request):
+        body = request.body if isinstance(request.body, bytes) else request.body.read()
+        request.body = b"y" * len(body)
+    after_signing(c, "PutObject", change)
+    after_signing(c, "DeleteObjects", change)
+    expect_error("XAmzContentSHA256Mismatch", 400, c.put_object, Bucket="bkt", Key="k", Body=b"x")
+    expect_error("XAmzContentSHA256Mismatch", 400, c.delete_objects, Bucket="bkt", Delete={"Objects": [{"Key": "k"}]})
+    assert "Contents" not in s3_client(auth_url).list_objects_v2(Bucket="bkt")
+
+
+def test_auth_failures(auth_url):
+    expect_error("SignatureDoesNotMatch", 403, auth_client(auth_url, secret="nope").list_buckets)
+    expect_error("InvalidAccessKeyId", 403, auth_client(auth_url, key="nope").list_buckets)
+    expect_error("AuthorizationHeaderMalformed", 400, auth_client(auth_url, region="eu-west-1").list_buckets)
+    assert error_of(requests.get(f"{auth_url}/bkt")) == (403, "AccessDenied")
+    # A signature of another path or query.
+    c = auth_client(auth_url)
+
+    def change(request):
+        request.url = request.url.replace("/bkt/a", "/bkt/b").replace("prefix=a", "prefix=b")
+    after_signing(c, "GetObject", change)
+    after_signing(c, "ListObjectsV2", change)
+    expect_error("SignatureDoesNotMatch", 403, c.get_object, Bucket="bkt", Key="a")
+    expect_error("SignatureDoesNotMatch", 403, c.list_objects_v2, Bucket="bkt", Prefix="a")
+
+
+def now_amz() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def authorization(credential: str) -> str:
+    return f"AWS4-HMAC-SHA256 Credential={credential}, SignedHeaders=host;x-amz-date, Signature=00"
+
+
+@pytest.mark.parametrize("headers, error", [
+    ({"Authorization": "AWS labaz:c2ln"}, (501, "NotImplemented")),
+    ({"Authorization": "Bearer x"}, (400, "InvalidArgument")),
+    ({"Authorization": "AWS4-HMAC-SHA256 Credential=labaz/20260101/us-east-1/s3/aws4_request"},
+     (400, "AuthorizationHeaderMalformed")),
+    ({"Authorization": authorization("labaz/20260101/us-east-1/s3")}, (400, "AuthorizationHeaderMalformed")),
+    ({"Authorization": authorization("labaz/20200101/us-east-1/s3/aws4_request"), "x-amz-date": "20200101T000000Z"},
+     (403, "RequestTimeTooSkewed")),
+    ({"Authorization": authorization("labaz/20200101/us-east-1/s3/aws4_request")}, (403, "AccessDenied")),
+    ({"Authorization": authorization("labaz/20200101/us-east-1/s3/aws4_request"), "x-amz-date": now_amz()},
+     (400, "AuthorizationHeaderMalformed")),
+    ({"Authorization": authorization(f"labaz/{now_amz()[:8]}/us-east-1/dynamodb/aws4_request"),
+      "x-amz-date": now_amz()}, (400, "AuthorizationHeaderMalformed")),
+    ({"Authorization": authorization(f"labaz/{now_amz()[:8]}/us-east-1/s3/aws4_request"), "x-amz-date": now_amz()},
+     (400, "InvalidRequest")),
+    ({"Authorization": authorization(f"labaz/{now_amz()[:8]}/us-east-1/s3/aws4_request"), "x-amz-date": now_amz(),
+      "x-amz-content-sha256": "nope"}, (400, "InvalidArgument")),
+    ({"Authorization": authorization(f"labaz/{now_amz()[:8]}/us-east-1/s3/aws4_request"), "x-amz-date": now_amz(),
+      "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER"}, (501, "NotImplemented")),
+    ({"Authorization": authorization("labaz/20260101/us-east-1/s3/aws4_request"), "x-amz-security-token": "t"},
+     (501, "NotImplemented")),
+])
+def test_auth_bad_requests(auth_url, headers, error):
+    assert error_of(requests.get(f"{auth_url}/bkt", headers=headers)) == error
+
+
+@pytest.mark.parametrize("version", ["s3", "s3v4"])
+def test_auth_presigned_url(auth_url, version):
+    url = s3_client(auth_url, signature_version=version).generate_presigned_url(
+        "get_object", Params={"Bucket": "bkt", "Key": "k"})
+    assert error_of(requests.get(url)) == (501, "NotImplemented")
 
 
 # The wire
