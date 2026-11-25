@@ -53,6 +53,7 @@ Every reply has an `x-amz-request-id` header. Replies to `HEAD` have no body.
 | HeadObject | `HEAD /{bucket}/{key}` | the same headers as GetObject, `Range` and conditions included |
 | DeleteObject | `DELETE /{bucket}/{key}` | 204, also if the key does not exist |
 | CopyObject | `PUT /{bucket}/{key}` with `x-amz-copy-source` | see below |
+| DeleteObjects | `POST /{bucket}?delete` | see below |
 
 GetObject and HeadObject reply with `Content-Length`, `ETag`, `Last-Modified`,
 `Accept-Ranges: bytes`, `Content-Type: binary/octet-stream` and the
@@ -94,6 +95,16 @@ or a `versionId` of it, fails with `NotImplemented`. `x-amz-copy-source` is
 - `If-None-Match: *` applies to the destination.
 - The reply is a `CopyObjectResult` with `ETag`, `LastModified` and the
   checksum.
+
+DeleteObjects deletes up to 1000 keys as DeleteObject does, so a key that
+does not exist is deleted too. The request needs `Content-MD5` or an
+`x-amz-checksum-<algorithm>` of its body (`InvalidRequest`), which is
+verified (`BadDigest`). A body that does not parse, lists no keys or more
+than 1000 fails with `MalformedXML`; a `VersionId`, `ETag`,
+`LastModifiedTime` or `Size` of an object fails with `NotImplemented`. A key
+that cannot be deleted (one ending with `/`, or too long) gets an `Error`
+entry of its own in the `DeleteResult`, and the others are deleted still.
+With `Quiet`, only the errors are listed.
 
 Keys are up to 1024 bytes (`KeyTooLongError`). Keys ending with `/` are not
 supported and are refused with `InvalidArgument`.
@@ -163,7 +174,7 @@ in byte order. Entries have `Key`, `LastModified`, `ETag`, `Size`,
 - Copying from another bucket.
 - ListMultipartUploads: the storage does not list sessions.
 - Object tagging.
-- DeleteObjects, versioning and every other bucket sub-resource.
+- Versioning and every other bucket sub-resource.
 - Conditional writes other than `If-None-Match: *`, `response-*` overrides,
   `partNumber` reads.
 - Stored system metadata: `Content-Type`, `Cache-Control` and the like

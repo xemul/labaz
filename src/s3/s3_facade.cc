@@ -17,6 +17,7 @@
 #include <pugixml.hpp>
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/matchrules.hh>
@@ -42,6 +43,9 @@ static constexpr std::string_view xml_type = "application/xml";
 static constexpr std::string_view default_object_type = "binary/octet-stream";
 static constexpr unsigned max_list_keys = 1000;
 static constexpr unsigned max_list_parts = 1000;
+static constexpr unsigned max_delete_keys = 1000;
+// How many keys of a DeleteObjects request are deleted at once.
+static constexpr size_t delete_concurrency = 16;
 static constexpr size_t max_key_length = 1024;
 static constexpr unsigned max_part_number = 10000;
 // Every part of a multipart upload but the last must have at least this.
@@ -321,6 +325,14 @@ static void check_key_length(std::string_view key) {
     }
 }
 
+// Checks a key given other than as the request's path.
+static void check_key(std::string_view key) {
+    if (key.ends_with('/')) {
+        throw invalid_argument("Keys ending with '/' are not supported");
+    }
+    check_key_length(key);
+}
+
 static sstring key_param(const request& req) {
     // The routes drop a trailing '/' from the path, but keys ending with
     // '/' are not supported, so refuse them rather than use another key.
@@ -360,10 +372,7 @@ static object_name copy_source(const request& req) {
     if (slash == 0 || slash == std::string_view::npos || slash + 1 == path.size()) {
         throw invalid_argument("Copy Source must mention the source bucket and key: sourcebucket/sourcekey");
     }
-    if (path.ends_with('/')) {
-        throw invalid_argument("Keys ending with '/' are not supported");
-    }
-    check_key_length(path.substr(slash + 1));
+    check_key(path.substr(slash + 1));
     return object_name{sstring(path.substr(0, slash)), sstring(path.substr(slash + 1))};
 }
 
@@ -746,6 +755,42 @@ static std::vector<completed_part> parse_completed_parts(std::string_view body) 
     return ret;
 }
 
+// The objects listed in a DeleteObjects request.
+struct objects_to_delete {
+    bool quiet;
+    std::vector<sstring> keys;
+};
+
+// Parses a DeleteObjects request body.
+static objects_to_delete parse_objects_to_delete(std::string_view body) {
+    pugi::xml_document doc;
+    // Keep a key that is all whitespace.
+    if (!doc.load_buffer(body.data(), body.size(), pugi::parse_default | pugi::parse_ws_pcdata_single)) {
+        throw malformed_xml();
+    }
+    auto root = doc.child("Delete");
+    if (!root) {
+        throw malformed_xml();
+    }
+    objects_to_delete ret{root.child("Quiet").text().as_bool(), {}};
+    for (auto o : root.children("Object")) {
+        auto key = o.child("Key");
+        if (!key) {
+            throw malformed_xml();
+        }
+        for (auto name : {"VersionId", "ETag", "LastModifiedTime", "Size"}) {
+            if (o.child(name)) {
+                throw not_implemented(fmt::format("The {} of an object to delete", name));
+            }
+        }
+        ret.keys.emplace_back(key.child_value());
+    }
+    if (ret.keys.empty() || ret.keys.size() > max_delete_keys) {
+        throw malformed_xml();
+    }
+    return ret;
+}
+
 // The headers of GetObject and HeadObject replies. The checksums of the
 // object only go with the whole object, and when asked for.
 static void add_object_headers(reply& rep, const request& req, const object_info& info, bool whole) {
@@ -1051,18 +1096,74 @@ private:
         co_return empty_reply(std::move(rep), status::no_content);
     }
 
-    future<std::unique_ptr<reply>> head_bucket(request& req, std::unique_ptr<reply> rep) {
-        auto bucket = bucket_param(req);
+    future<> check_bucket(const sstring& bucket) {
         auto buckets = co_await _storage.list_buckets();
         if (std::ranges::find(buckets, bucket) == buckets.end()) {
             throw storage_error(errc::no_such_bucket, "");
         }
+    }
+
+    future<std::unique_ptr<reply>> head_bucket(request& req, std::unique_ptr<reply> rep) {
+        co_await check_bucket(bucket_param(req));
         co_return empty_reply(std::move(rep), status::ok);
     }
 
-    future<std::unique_ptr<reply>> post_bucket(request& req, std::unique_ptr<reply>) {
-        reject_query_params(req, {"delete"});
+    future<std::unique_ptr<reply>> post_bucket(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("delete")) {
+            co_return co_await delete_objects(req, std::move(rep));
+        }
         throw not_implemented("POST on a bucket");
+    }
+
+    // Deletes the keys one by one, as DeleteObject does, so a key that
+    // does not exist is deleted too. A key that fails to be deleted gets an
+    // error of its own, and the others are deleted still.
+    future<std::unique_ptr<reply>> delete_objects(request& req, std::unique_ptr<reply> rep) {
+        check_plain_body(req);
+        auto sums = upload_checksums_from_headers(req);
+        if (sums.expected.empty()) {
+            throw invalid_request("Missing required header for this request: Content-MD5");
+        }
+        auto in = make_verifying_stream(*req.content_stream, std::move(sums.expected));
+        auto objects = parse_objects_to_delete(co_await util::read_entire_stream_contiguous(in));
+        auto bucket = bucket_param(req);
+        co_await check_bucket(bucket);
+
+        std::vector<std::optional<s3_error>> errors(objects.keys.size());
+        co_await max_concurrent_for_each(std::views::iota(size_t(0), objects.keys.size()), delete_concurrency,
+                [&] (size_t i) -> future<> {
+            errors[i] = co_await delete_key(bucket, objects.keys[i]);
+        });
+
+        xml_writer w;
+        w.root("DeleteResult");
+        for (size_t i = 0; i < objects.keys.size(); i++) {
+            if (errors[i]) {
+                w.open("Error")
+                    .element("Key", objects.keys[i])
+                    .element("Code", errors[i]->code())
+                    .element("Message", errors[i]->what())
+                    .close("Error");
+            } else if (!objects.quiet) {
+                w.open("Deleted").element("Key", objects.keys[i]).close("Deleted");
+            }
+        }
+        w.close("DeleteResult");
+        co_return xml_reply(std::move(rep), w);
+    }
+
+    future<std::optional<s3_error>> delete_key(const sstring& bucket, const sstring& key) {
+        try {
+            check_key(key);
+            co_await _storage.delete_object(bucket, key);
+        } catch (const s3_error& e) {
+            co_return e;
+        } catch (const storage_error& e) {
+            if (e.code() != errc::no_such_key) {
+                co_return to_s3_error(e);
+            }
+        }
+        co_return std::nullopt;
     }
 
     future<std::unique_ptr<reply>> list_objects(request& req, std::unique_ptr<reply> rep) {

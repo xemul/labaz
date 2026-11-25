@@ -583,6 +583,88 @@ def test_upload_part_copy_bad_upload(s3):
     expect_error("NoSuchUpload", 404, part_copy, s3, "nope", 1, "nope")
 
 
+# DeleteObjects
+
+def delete_objects(s3, keys: list[str], **kwargs) -> dict:
+    return s3.delete_objects(Bucket="bkt", Delete={"Objects": [{"Key": k} for k in keys], **kwargs})
+
+
+def post_delete(s3_url, body: bytes, headers: dict | None = None) -> requests.Response:
+    if headers is None:
+        headers = {"Content-MD5": b64(hashlib.md5(body).hexdigest())}
+    return requests.post(f"{s3_url}/bkt?delete", data=body, headers=headers)
+
+
+def objects_xml(keys: list[str], extra: str = "") -> bytes:
+    return ("<Delete>" + "".join(f"<Object><Key>{k}</Key>{extra}</Object>" for k in keys) + "</Delete>").encode()
+
+
+def test_delete_objects(s3):
+    """Missing keys are deleted too, as DeleteObject deletes them."""
+    for k in ["a", "b", " "]:
+        s3.put_object(Bucket="bkt", Key=k, Body=b"x")
+    r = delete_objects(s3, ["a", "nope", " ", "b"])
+    assert [d["Key"] for d in r["Deleted"]] == ["a", "nope", " ", "b"]
+    assert "Errors" not in r
+    assert "Contents" not in s3.list_objects_v2(Bucket="bkt")
+
+
+def test_delete_objects_errors(s3):
+    """A key that cannot be deleted gets an error, and the others are deleted."""
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x")
+    r = delete_objects(s3, ["dir/", "x" * 1025, "k"])
+    assert [d["Key"] for d in r["Deleted"]] == ["k"]
+    assert [(e["Key"], e["Code"]) for e in r["Errors"]] == [("dir/", "InvalidArgument"), ("x" * 1025, "KeyTooLongError")]
+    expect_error("404", 404, s3.head_object, Bucket="bkt", Key="k")
+
+
+def test_delete_objects_quiet(s3):
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x")
+    r = delete_objects(s3, ["k", "dir/"], Quiet=True)
+    assert "Deleted" not in r
+    assert [e["Key"] for e in r["Errors"]] == ["dir/"]
+    expect_error("404", 404, s3.head_object, Bucket="bkt", Key="k")
+
+
+def test_delete_objects_no_bucket(s3):
+    expect_error("NoSuchBucket", 404, s3.delete_objects, Bucket="nope", Delete={"Objects": [{"Key": "k"}]})
+
+
+def test_delete_objects_raw_xml(s3_url, s3):
+    r = post_delete(s3_url, objects_xml(["a&b"]))
+    assert (r.status_code, r.headers["Content-Type"]) == (200, "application/xml")
+    root = ET.fromstring(r.content)
+    assert root.tag == f"{NS}DeleteResult"
+    assert [e.text for e in root.iter(f"{NS}Key")] == ["a&b"]
+
+
+@pytest.mark.parametrize("body", [b"", b"<nope", b"<Delete/>", b"<Delete><Object/></Delete>",
+                                  objects_xml([str(i) for i in range(1001)])])
+def test_delete_objects_malformed(s3_url, s3, body):
+    r = post_delete(s3_url, body)
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "MalformedXML")
+
+
+def test_delete_objects_checksums(s3_url, s3):
+    """S3 requires Content-MD5 or a checksum of the body."""
+    body = objects_xml(["k"])
+    r = post_delete(s3_url, body, {})
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "InvalidRequest")
+    r = post_delete(s3_url, body, {"Content-MD5": b64(hashlib.md5(b"x").hexdigest())})
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "BadDigest")
+    r = post_delete(s3_url, body, {"x-amz-checksum-crc32": b64(digest("crc32", body))})
+    assert r.status_code == 200, r.content
+
+
+@pytest.mark.parametrize("extra", ["<VersionId>1</VersionId>", "<ETag>\"x\"</ETag>",
+                                   "<LastModifiedTime>2026-01-01T00:00:00Z</LastModifiedTime>", "<Size>1</Size>"])
+def test_delete_objects_not_implemented(s3_url, s3, extra):
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x")
+    r = post_delete(s3_url, objects_xml(["k"], extra))
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (501, "NotImplemented")
+    assert s3.get_object(Bucket="bkt", Key="k")["Body"].read() == b"x"
+
+
 # Listing
 
 @pytest.fixture
@@ -719,7 +801,7 @@ def test_error_reply(s3_url, s3):
     ("GET", "/bkt?uploads", {}),
     ("GET", "/bkt/k?versionId=1", {}),
     ("GET", "/bkt?versioning", {}),
-    ("POST", "/bkt?delete", {}),
+    ("POST", "/bkt", {}),
 ])
 def test_not_implemented(s3_url, s3, method, path, headers):
     s3.put_object(Bucket="bkt", Key="k", Body=b"x")
