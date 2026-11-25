@@ -49,6 +49,9 @@ static constexpr std::string_view default_object_type = "binary/octet-stream";
 static constexpr unsigned max_list_keys = 1000;
 static constexpr unsigned max_list_parts = 1000;
 static constexpr unsigned max_delete_keys = 1000;
+static constexpr unsigned max_tags = 10;
+static constexpr size_t max_tag_key_length = 128;
+static constexpr size_t max_tag_value_length = 256;
 // How many keys of a DeleteObjects request are deleted at once.
 static constexpr size_t delete_concurrency = 16;
 static constexpr size_t max_key_length = 1024;
@@ -375,6 +378,53 @@ static user_metadata metadata_from_headers(const request& req) {
     return ret;
 }
 
+static s3_error invalid_tag(std::string_view msg) {
+    return s3_error(status::bad_request, "InvalidTag", std::string(msg));
+}
+
+// The length in characters of UTF-8 text.
+static size_t utf8_length(std::string_view s) {
+    return std::ranges::count_if(s, [] (char c) { return (static_cast<unsigned char>(c) & 0xc0) != 0x80; });
+}
+
+// Adds a tag, as S3's rules allow.
+static void add_tag(object_tags& tags, sstring key, sstring value) {
+    if (key.empty() || utf8_length(key) > max_tag_key_length) {
+        throw invalid_tag("The TagKey you have provided is invalid");
+    }
+    if (utf8_length(value) > max_tag_value_length) {
+        throw invalid_tag("The TagValue you have provided is invalid");
+    }
+    if (tags.contains(key)) {
+        throw invalid_tag("Cannot provide multiple Tags with the same key");
+    }
+    if (tags.size() == max_tags) {
+        throw s3_error(status::bad_request, "BadRequest", fmt::format("Object tags cannot be greater than {}", max_tags));
+    }
+    tags.emplace(std::move(key), std::move(value));
+}
+
+// x-amz-tagging: "key=value&key=value", URL-encoded.
+static object_tags tags_from_headers(const request& req) {
+    object_tags tags;
+    auto header = req.get_header("x-amz-tagging");
+    for (auto part : std::string_view(header) | std::views::split('&')) {
+        std::string_view tag(part);
+        if (tag.empty()) {
+            continue;
+        }
+        auto eq = tag.find('=');
+        sstring key, value;
+        if (!http::internal::url_decode(tag.substr(0, eq), key)
+                || (eq != std::string_view::npos && !http::internal::url_decode(tag.substr(eq + 1), value))) {
+            throw invalid_argument("The header 'x-amz-tagging' shall be encoded as UTF-8 then URLEncoded URL query parameters "
+                                   "without tag name duplicates.");
+        }
+        add_tag(tags, std::move(key), std::move(value));
+    }
+    return tags;
+}
+
 // The precondition of a write: only If-None-Match: * (the key must not
 // exist) is supported.
 static precondition write_precondition(const request& req) {
@@ -484,6 +534,18 @@ static void check_plain_body(const request& req) {
             || req._headers.contains("x-amz-decoded-content-length")) {
         throw not_implemented("An aws-chunked request body");
     }
+}
+
+// The body of a request that S3 wants a Content-MD5 or a checksum of,
+// verified against it.
+static future<sstring> read_checksummed_body(request& req) {
+    check_plain_body(req);
+    auto sums = upload_checksums_from_headers(req);
+    if (sums.expected.empty()) {
+        throw invalid_request("Missing required header for this request: Content-MD5");
+    }
+    auto in = make_verifying_stream(*req.content_stream, std::move(sums.expected));
+    co_return co_await util::read_entire_stream_contiguous(in);
 }
 
 // S3 ignores a Range header it cannot parse, as HTTP allows.
@@ -644,6 +706,29 @@ static std::vector<completed_part> parse_completed_parts(std::string_view body) 
     return ret;
 }
 
+// Parses a PutObjectTagging request body:
+// <Tagging><TagSet><Tag><Key>..</Key><Value>..</Value></Tag>...</TagSet></Tagging>.
+static object_tags parse_tagging(std::string_view body) {
+    pugi::xml_document doc;
+    if (!doc.load_buffer(body.data(), body.size(), pugi::parse_default | pugi::parse_ws_pcdata_single)) {
+        throw malformed_xml();
+    }
+    auto set = doc.child("Tagging").child("TagSet");
+    if (!set) {
+        throw malformed_xml();
+    }
+    object_tags tags;
+    for (auto t : set.children("Tag")) {
+        auto key = t.child("Key");
+        auto value = t.child("Value");
+        if (!key || !value) {
+            throw malformed_xml();
+        }
+        add_tag(tags, key.child_value(), value.child_value());
+    }
+    return tags;
+}
+
 // The objects listed in a DeleteObjects request.
 struct objects_to_delete {
     bool quiet;
@@ -688,6 +773,9 @@ static void add_object_headers(reply& rep, const request& req, const object_info
     rep.add_header("Accept-Ranges", "bytes");
     for (auto& [k, v] : info.attrs.metadata) {
         rep.add_header(fmt::format("x-amz-meta-{}", k), v);
+    }
+    if (!info.attrs.tags.empty()) {
+        rep.add_header("x-amz-tagging-count", fmt::to_string(info.attrs.tags.size()));
     }
     if (whole && equals_ignoring_case(req.get_header("x-amz-checksum-mode"), "ENABLED")) {
         if (auto c = object_checksum(info)) {
@@ -1251,13 +1339,7 @@ private:
     // does not exist is deleted too. A key that fails to be deleted gets an
     // error of its own, and the others are deleted still.
     future<std::unique_ptr<reply>> delete_objects(request& req, std::unique_ptr<reply> rep) {
-        check_plain_body(req);
-        auto sums = upload_checksums_from_headers(req);
-        if (sums.expected.empty()) {
-            throw invalid_request("Missing required header for this request: Content-MD5");
-        }
-        auto in = make_verifying_stream(*req.content_stream, std::move(sums.expected));
-        auto objects = parse_objects_to_delete(co_await util::read_entire_stream_contiguous(in));
+        auto objects = parse_objects_to_delete(co_await read_checksummed_body(req));
         auto bucket = bucket_param(req);
         co_await check_bucket(bucket);
 
@@ -1407,6 +1489,9 @@ private:
     // Objects, or their multipart uploads with ?uploadId= (and ?uploads)
 
     future<std::unique_ptr<reply>> get_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("tagging")) {
+            return get_object_tagging(req, std::move(rep));
+        }
         if (req.has_query_param("uploadId")) {
             return list_parts(req, std::move(rep));
         }
@@ -1414,6 +1499,9 @@ private:
     }
 
     future<std::unique_ptr<reply>> put_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("tagging")) {
+            return put_object_tagging(req, std::move(rep));
+        }
         if (req.has_query_param("uploadId") || req.has_query_param("partNumber")) {
             return upload_part(req, std::move(rep));
         }
@@ -1424,6 +1512,9 @@ private:
     }
 
     future<std::unique_ptr<reply>> delete_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("tagging")) {
+            return delete_object_tagging(req, std::move(rep));
+        }
         if (req.has_query_param("uploadId")) {
             return abort_multipart_upload(req, std::move(rep));
         }
@@ -1491,13 +1582,13 @@ private:
     }
 
     future<std::unique_ptr<reply>> put_whole_object(request& req, std::unique_ptr<reply> rep) {
-        reject_query_params(req, {"acl", "legal-hold", "retention", "tagging"});
-        reject_headers(req, {"x-amz-tagging"});
+        reject_query_params(req, {"acl", "legal-hold", "retention"});
         check_plain_body(req);
         auto pre = write_precondition(req);
         auto sums = upload_checksums_from_headers(req);
         object_attrs attrs;
         attrs.metadata = metadata_from_headers(req);
+        attrs.tags = tags_from_headers(req);
         attrs.checksums = default_checksums;
         attrs.checksums.insert(sums.algorithms.begin(), sums.algorithms.end());
 
@@ -1547,8 +1638,7 @@ private:
     // computes from the data otherwise. So its ETag is the MD5 of its data,
     // even when the source's is a multipart one.
     future<std::unique_ptr<reply>> copy_object(request& req, std::unique_ptr<reply> rep) {
-        reject_query_params(req, {"acl", "legal-hold", "retention", "tagging"});
-        reject_headers(req, {"x-amz-tagging"});
+        reject_query_params(req, {"acl", "legal-hold", "retention"});
         auto bucket = bucket_param(req);
         auto key = key_param(req);
         auto src = copy_source(req);
@@ -1561,6 +1651,16 @@ private:
             throw invalid_argument("Unknown metadata directive.");
         }
         bool replace = directive == "REPLACE";
+        // The copy has the source's tags, unless told otherwise, when the
+        // request's x-amz-tagging is ignored.
+        auto tagging_directive = req.get_header("x-amz-tagging-directive");
+        if (!tagging_directive.empty() && tagging_directive != "COPY" && tagging_directive != "REPLACE") {
+            throw invalid_argument("Unknown tagging directive.");
+        }
+        std::optional<object_tags> tags;
+        if (tagging_directive == "REPLACE") {
+            tags = tags_from_headers(req);
+        }
         if (src.key == key && !replace) {
             throw invalid_request("This copy request is illegal because it is trying to copy an object to itself "
                                   "without changing the object's metadata, storage class, website redirect location "
@@ -1573,6 +1673,7 @@ private:
             auto src_info = co_await copy_source_info(req, bucket, src.key);
             object_attrs attrs;
             attrs.metadata = replace ? metadata_from_headers(req) : src_info.attrs.metadata;
+            attrs.tags = tags ? *tags : src_info.attrs.tags;
             attrs.checksums = default_checksums;
             attrs.checksums.insert(alg.value_or(upload_algorithm(src_info.attrs.checksums)));
 
@@ -1623,12 +1724,42 @@ private:
         co_return empty_reply(std::move(rep), status::no_content);
     }
 
+    // Object tagging
+
+    future<std::unique_ptr<reply>> get_object_tagging(request& req, std::unique_ptr<reply> rep) {
+        reject_query_params(req, {"versionId"});
+        auto info = co_await _storage.head_object(bucket_param(req), key_param(req));
+        xml_writer w;
+        w.root("Tagging");
+        w.open("TagSet");
+        for (auto& [k, v] : info.attrs.tags) {
+            w.open("Tag").element("Key", k).element("Value", v).close("Tag");
+        }
+        w.close("TagSet");
+        w.close("Tagging");
+        co_return xml_reply(std::move(rep), w);
+    }
+
+    // Replaces the object's tags, in place: its ETag and Last-Modified stay.
+    future<std::unique_ptr<reply>> put_object_tagging(request& req, std::unique_ptr<reply> rep) {
+        reject_query_params(req, {"versionId"});
+        auto tags = parse_tagging(co_await read_checksummed_body(req));
+        co_await _storage.update_object(bucket_param(req), key_param(req), attrs_update{.tags = std::move(tags)}, {});
+        co_return empty_reply(std::move(rep), status::ok);
+    }
+
+    future<std::unique_ptr<reply>> delete_object_tagging(request& req, std::unique_ptr<reply> rep) {
+        reject_query_params(req, {"versionId"});
+        co_await _storage.update_object(bucket_param(req), key_param(req), attrs_update{.tags = object_tags()}, {});
+        co_return empty_reply(std::move(rep), status::no_content);
+    }
+
     // Multipart uploads, which are the storage's sessions
 
     future<std::unique_ptr<reply>> create_multipart_upload(request& req, std::unique_ptr<reply> rep) {
-        reject_headers(req, {"x-amz-tagging"});
         object_attrs attrs;
         attrs.metadata = metadata_from_headers(req);
+        attrs.tags = tags_from_headers(req);
         attrs.checksums = default_checksums;
         auto alg = requested_algorithm(req);
         if (alg) {

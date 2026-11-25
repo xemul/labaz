@@ -14,7 +14,8 @@ has, and tests that need any of them skip the others:
   and be listed; GCS's resumable uploads append chunks in order.
 - "copy": copies of objects.
 - "parts" with "copy": parts copied from objects.
-- "head": HEAD requests (GCS's JSON API has none)."""
+- "head": HEAD requests (GCS's JSON API has none).
+- "tags": object tags (GCS has none)."""
 
 import base64
 import json
@@ -35,7 +36,7 @@ from facade_error import FacadeError
 from plywood_client import PlywoodClient
 
 FACADES = ["plywood", "s3", "gcs"]
-ALL_FEATURES = {"parts", "copy", "head"}
+ALL_FEATURES = {"parts", "copy", "head", "tags"}
 PART_SIZE = 5 << 20
 
 
@@ -131,6 +132,19 @@ class PlywoodFacade:
 
     def list_keys(self, bucket, prefix="", page=1000) -> list[str]:
         return self.c.list_keys(bucket, prefix=prefix, page=page)
+
+    def set_tags(self, bucket, key, tags: dict):
+        self.c.update_attrs(bucket, key, tags=tags)
+
+    def get_tags(self, bucket, key) -> dict:
+        # The object info, which listing has.
+        for o in self.c.list(bucket, prefix=key)["objects"]:
+            if o["key"] == key:
+                return o["tags"]
+        raise FacadeError(404, "no_such_key", key)
+
+    def clear_tags(self, bucket, key):
+        self.c.update_attrs(bucket, key, tags={})
 
     # multipart uploads
 
@@ -249,6 +263,16 @@ class S3Facade:
             if not r["IsTruncated"]:
                 return keys
             token = r["NextContinuationToken"]
+
+    def set_tags(self, bucket, key, tags: dict):
+        self._call("put_object_tagging", Bucket=bucket, Key=key,
+                   Tagging={"TagSet": [{"Key": k, "Value": v} for k, v in tags.items()]})
+
+    def get_tags(self, bucket, key) -> dict:
+        return {t["Key"]: t["Value"] for t in self._call("get_object_tagging", Bucket=bucket, Key=key)["TagSet"]}
+
+    def clear_tags(self, bucket, key):
+        self._call("delete_object_tagging", Bucket=bucket, Key=key)
 
     # multipart uploads
 

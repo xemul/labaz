@@ -467,6 +467,33 @@ def test_copy_odd_keys(client):
     assert client.read("bkt", "dst") == b"x"
 
 
+# Tags
+
+def test_tags(client):
+    """Tags are set, replaced and cleared in place."""
+    requires(client, "tags")
+    client.put("bkt", "k", b"data", metadata={"m": "v"})
+    assert client.get_tags("bkt", "k") == {}
+    client.set_tags("bkt", "k", {"a": "1", "B": "two words", "ü": ""})
+    assert client.get_tags("bkt", "k") == {"a": "1", "B": "two words", "ü": ""}
+    client.set_tags("bkt", "k", {"c": "3"})
+    assert client.get_tags("bkt", "k") == {"c": "3"}
+    o = client.get("bkt", "k")
+    assert (o.data, o.metadata) == (b"data", {"m": "v"})
+    client.clear_tags("bkt", "k")
+    assert client.get_tags("bkt", "k") == {}
+    client.set_tags("bkt", "k", {"c": "3"})
+    client.put("bkt", "k", b"new")
+    assert client.get_tags("bkt", "k") == {}  # a new version has none
+
+
+def test_tags_of_missing_objects(client):
+    requires(client, "tags")
+    expect_error(client, "no_such_key", client.set_tags, "bkt", "nope", {"a": "1"})
+    expect_error(client, "no_such_key", client.get_tags, "bkt", "nope")
+    expect_error(client, "no_such_key", client.clear_tags, "bkt", "nope")
+
+
 # Checksums
 
 def test_verify_object(client):

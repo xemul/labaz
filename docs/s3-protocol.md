@@ -75,16 +75,19 @@ Every reply has an `x-amz-request-id` header. Replies to `HEAD` have no body.
 
 | Operation | Request | Notes |
 |---|---|---|
-| PutObject | `PUT /{bucket}/{key}` | `x-amz-meta-*`, checksums (below), `If-None-Match: *` |
+| PutObject | `PUT /{bucket}/{key}` | `x-amz-meta-*`, `x-amz-tagging` (below), checksums (below), `If-None-Match: *` |
 | GetObject | `GET /{bucket}/{key}` | a single `Range: bytes=...`; an unparsable `Range` is ignored, as S3 does; conditions (below) |
 | HeadObject | `HEAD /{bucket}/{key}` | the same headers as GetObject, `Range` and conditions included |
 | DeleteObject | `DELETE /{bucket}/{key}` | 204, also if the key does not exist |
 | CopyObject | `PUT /{bucket}/{key}` with `x-amz-copy-source` | see below |
 | DeleteObjects | `POST /{bucket}?delete` | see below |
+| GetObjectTagging | `GET /{bucket}/{key}?tagging` | see below |
+| PutObjectTagging | `PUT /{bucket}/{key}?tagging` | see below |
+| DeleteObjectTagging | `DELETE /{bucket}/{key}?tagging` | 204 |
 
 GetObject and HeadObject reply with `Content-Length`, `ETag`, `Last-Modified`,
-`Accept-Ranges: bytes`, `Content-Type: binary/octet-stream` and the
-`x-amz-meta-*` headers.
+`Accept-Ranges: bytes`, `Content-Type: binary/octet-stream`, the
+`x-amz-meta-*` headers and, if the object has tags, `x-amz-tagging-count`.
 
 The `ETag` of an object is S3's: the quoted hex MD5 of its data for
 PutObject, and for a multipart upload the MD5 of the parts' MD5s followed by
@@ -108,6 +111,8 @@ or a `versionId` of it, fails with `NotImplemented`. `x-amz-copy-source` is
 - `x-amz-metadata-directive`: `COPY` (the default) keeps the source's
   `x-amz-meta-*`, ignoring the request's; `REPLACE` takes the request's.
   Copying an object onto itself requires `REPLACE` (`InvalidRequest`).
+- `x-amz-tagging-directive`, likewise: `COPY` keeps the source's tags,
+  ignoring `x-amz-tagging`; `REPLACE` takes the request's.
 - The copy is a new single upload, so its `ETag` is the MD5 of its data,
   also when the source's is a multipart one. Its checksum is of the
   `x-amz-checksum-algorithm` asked for or else the source's algorithm, and
@@ -133,6 +138,17 @@ that cannot be deleted (one ending with `/`, or too long) gets an `Error`
 entry of its own in the `DeleteResult`, and the others are deleted still.
 With `Quiet`, only the errors are listed.
 
+An object's tags are given with `x-amz-tagging: key=value&...`
+(URL-encoded) on PutObject, CreateMultipartUpload and CopyObject, read with
+GetObjectTagging (`<Tagging><TagSet><Tag>...`), and replaced or removed in
+place with PutObjectTagging and DeleteObjectTagging, which leave the
+object's `ETag` and `Last-Modified` as they are. A new version of an object
+has the tags it is made with. S3's rules apply: up to 10 tags
+(`BadRequest`), keys of 1 to 128 characters and values of up to 256
+(`InvalidTag`), no key twice (`InvalidTag`). PutObjectTagging requires a
+`Content-MD5` or `x-amz-checksum-*` of its body, as S3's API says
+(`InvalidRequest`). A `versionId` fails with `NotImplemented`.
+
 Keys are up to 1024 bytes (`KeyTooLongError`). Keys ending with `/` are not
 supported and are refused with `InvalidArgument`.
 
@@ -140,7 +156,7 @@ supported and are refused with `InvalidArgument`.
 
 | Operation | Request | Notes |
 |---|---|---|
-| CreateMultipartUpload | `POST /{bucket}/{key}?uploads` | `x-amz-meta-*`, `x-amz-checksum-algorithm`, `x-amz-checksum-type` (below) |
+| CreateMultipartUpload | `POST /{bucket}/{key}?uploads` | `x-amz-meta-*`, `x-amz-tagging`, `x-amz-checksum-algorithm`, `x-amz-checksum-type` (below) |
 | UploadPart | `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}` | part numbers 1 to 10000; checksums as for PutObject; the reply's `ETag` is the part's MD5 |
 | UploadPartCopy | UploadPart's request with `x-amz-copy-source` | see below |
 | CompleteMultipartUpload | `POST /{bucket}/{key}?uploadId={id}` | `If-None-Match: *`, `x-amz-mp-object-size`, `x-amz-checksum-<algorithm>` of the whole object |
@@ -201,7 +217,6 @@ in byte order. Entries have `Key`, `LastModified`, `ETag`, `Size`,
   request bodies.
 - Copying from another bucket.
 - ListMultipartUploads: the storage does not list sessions.
-- Object tagging.
 - Versioning and every other bucket sub-resource.
 - Conditional writes other than `If-None-Match: *`, `response-*` overrides,
   `partNumber` reads.

@@ -761,6 +761,109 @@ def test_list_bad_params(s3_url, s3, params):
     assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "InvalidArgument")
 
 
+# Tagging
+
+def tags_of(s3, key: str) -> dict:
+    return {t["Key"]: t["Value"] for t in s3.get_object_tagging(Bucket="bkt", Key=key)["TagSet"]}
+
+
+def test_tagging_header(s3):
+    """x-amz-tagging tags objects as they are made; GET and HEAD count them."""
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x", Tagging="k1=v1&k%202=v%202&e=&n")
+    assert tags_of(s3, "k") == {"k1": "v1", "k 2": "v 2", "e": "", "n": ""}
+    assert s3.get_object(Bucket="bkt", Key="k")["TagCount"] == 4
+    assert s3.head_object(Bucket="bkt", Key="k")["ResponseMetadata"]["HTTPHeaders"]["x-amz-tagging-count"] == "4"
+    s3.put_object(Bucket="bkt", Key="none", Body=b"x")
+    assert "TagCount" not in s3.get_object(Bucket="bkt", Key="none")
+    u = s3.create_multipart_upload(Bucket="bkt", Key="m", Tagging="mp=1")["UploadId"]
+    p = s3.upload_part(Bucket="bkt", Key="m", UploadId=u, PartNumber=1, Body=b"x")
+    s3.complete_multipart_upload(Bucket="bkt", Key="m", UploadId=u, MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": p["ETag"]}]})
+    assert tags_of(s3, "m") == {"mp": "1"}
+
+
+def test_copy_tagging_directive(s3):
+    """A copy has the source's tags, and the request's (ignored otherwise)
+    with REPLACE."""
+    s3.put_object(Bucket="bkt", Key="src", Body=b"x", Tagging="a=1")
+    copy(s3, "c1", "src")
+    assert tags_of(s3, "c1") == {"a": "1"}
+    copy(s3, "c2", "src", Tagging="b=2")
+    assert tags_of(s3, "c2") == {"a": "1"}
+    copy(s3, "c3", "src", Tagging="b=2", TaggingDirective="REPLACE")
+    assert tags_of(s3, "c3") == {"b": "2"}
+    copy(s3, "c4", "src", TaggingDirective="REPLACE")
+    assert tags_of(s3, "c4") == {}
+
+
+def test_copy_bad_tagging_directive(s3_url, s3):
+    s3.put_object(Bucket="bkt", Key="src", Body=b"x")
+    r = requests.put(f"{s3_url}/bkt/dst", headers={"x-amz-copy-source": "/bkt/src", "x-amz-tagging-directive": "MERGE"})
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "InvalidArgument")
+
+
+def test_tagging_in_place(s3):
+    """Changing the tags leaves the object's version be: its ETag and
+    Last-Modified stay."""
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x")
+    before = s3.head_object(Bucket="bkt", Key="k")
+    s3.put_object_tagging(Bucket="bkt", Key="k", Tagging={"TagSet": [{"Key": "a", "Value": "1"}]})
+    after = s3.head_object(Bucket="bkt", Key="k")
+    assert (after["ETag"], after["LastModified"]) == (before["ETag"], before["LastModified"])
+    assert s3.delete_object_tagging(Bucket="bkt", Key="k")["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+
+@pytest.mark.parametrize("tagging, code", [
+    ("&".join(f"t{i}=v" for i in range(11)), "BadRequest"),
+    ("k" * 129 + "=v", "InvalidTag"),
+    ("k=" + "v" * 257, "InvalidTag"),
+    ("a=1&a=2", "InvalidTag"),
+    ("=v", "InvalidTag"),
+])
+def test_tagging_header_limits(s3, tagging, code):
+    expect_error(code, 400, s3.put_object, Bucket="bkt", Key="k", Body=b"x", Tagging=tagging)
+    expect_error("404", 404, s3.head_object, Bucket="bkt", Key="k")  # HEAD has no error body
+
+
+def tagging_xml(tags: str) -> bytes:
+    return f"<Tagging><TagSet>{tags}</TagSet></Tagging>".encode()
+
+
+def put_tagging(s3_url, body: bytes, headers: dict | None = None) -> requests.Response:
+    if headers is None:
+        headers = {"Content-MD5": b64(hashlib.md5(body).hexdigest())}
+    return requests.put(f"{s3_url}/bkt/k?tagging", data=body, headers=headers)
+
+
+@pytest.mark.parametrize("body, code", [
+    (tagging_xml("".join(f"<Tag><Key>t{i}</Key><Value>v</Value></Tag>" for i in range(11))), "BadRequest"),
+    (tagging_xml("<Tag><Key>a</Key><Value>1</Value></Tag><Tag><Key>a</Key><Value>2</Value></Tag>"), "InvalidTag"),
+    (tagging_xml("<Tag><Key>a</Key></Tag>"), "MalformedXML"),
+    (tagging_xml("<Tag><Value>1</Value></Tag>"), "MalformedXML"),
+    (b"<Tagging/>", "MalformedXML"),
+    (b"<nope", "MalformedXML"),
+])
+def test_put_tagging_errors(s3_url, s3, body, code):
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x", Tagging="keep=1")
+    r = put_tagging(s3_url, body)
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, code)
+    assert tags_of(s3, "k") == {"keep": "1"}
+
+
+def test_put_tagging_needs_checksum(s3_url, s3):
+    """As S3's API says, although some S3 servers do without."""
+    s3.put_object(Bucket="bkt", Key="k", Body=b"x")
+    body = tagging_xml("<Tag><Key>a</Key><Value>1</Value></Tag>")
+    r = put_tagging(s3_url, body, {})
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "InvalidRequest")
+    r = put_tagging(s3_url, body, {"Content-MD5": b64(hashlib.md5(b"x").hexdigest())})
+    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "BadDigest")
+    assert put_tagging(s3_url, body).status_code == 200
+    r = requests.get(f"{s3_url}/bkt/k?tagging")
+    root = ET.fromstring(r.content)
+    assert root.tag == f"{NS}Tagging"
+    assert [(t.find(f"{NS}Key").text, t.find(f"{NS}Value").text) for t in root.iter(f"{NS}Tag")] == [("a", "1")]
+
+
 # Authentication (SigV4)
 
 @pytest.fixture
@@ -918,17 +1021,14 @@ def test_error_reply(s3_url, s3):
 
 
 @pytest.mark.parametrize("method, path, headers", [
-    ("PUT", "/bkt/k?tagging", {}),
-    ("GET", "/bkt/k?tagging", {}),
-    ("PUT", "/bkt/k", {"x-amz-tagging": "a=b"}),
+    ("GET", "/bkt/k?tagging&versionId=1", {}),
+    ("DELETE", "/bkt/k?tagging&versionId=1", {}),
     ("PUT", "/bkt/k", {"x-amz-copy-source": "/bkt2/k"}),
     ("PUT", "/bkt/k", {"x-amz-copy-source": "/bkt/k?versionId=1", "x-amz-metadata-directive": "REPLACE"}),
-    ("PUT", "/bkt/k", {"x-amz-copy-source": "/bkt/k", "x-amz-metadata-directive": "REPLACE", "x-amz-tagging": "a=b"}),
     ("PUT", "/bkt/k", {"If-Match": '"x"'}),
     ("PUT", "/bkt/k", {"If-None-Match": '"x"'}),
     ("PUT", "/bkt/k", {"x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"}),
     ("PUT", "/bkt/k", {"Content-Encoding": "aws-chunked"}),
-    ("POST", "/bkt/k?uploads", {"x-amz-tagging": "a=b"}),
     ("POST", "/bkt/k?uploads", {"x-amz-checksum-algorithm": "CRC32", "x-amz-checksum-type": "FULL_OBJECT"}),
     ("PUT", "/bkt/k?partNumber=1&uploadId=x", {"x-amz-copy-source": "/bkt2/k"}),
     ("GET", "/bkt?uploads", {}),
