@@ -46,6 +46,23 @@ and streams the data between the two.
 Once all facades listen, the server prints `labaz: ready` to stdout. It stops
 on SIGINT or SIGTERM.
 
+## Container
+
+```sh
+podman build -f container/Containerfile -t labaz .
+podman run --rm -p 7070:7070 -p 4443:4443 -e LABAZ_S3_KEY=<access-key>:<secret> labaz
+```
+
+The image serves the S3 facade on port 7070 and the GCS facade on 4443, on
+all addresses, with the potato backend's data in the `/var/lib/labaz`
+volume. Environment variables configure it: `LABAZ_S3_PORT` and
+`LABAZ_GCS_PORT` (empty for no such facade), `LABAZ_S3_KEY` and
+`LABAZ_S3_REGION`, `LABAZ_SMP` (1) and `LABAZ_MEMORY` (1G); arguments go to
+`labaz` as they are. See [container/entrypoint.sh](container/entrypoint.sh).
+For now the image is built in ScyllaDB's toolchain image
+(`docker.io/scylladb/scylla-toolchain`), which has Seastar's build
+dependencies; `--build-arg BUILDER=<image>` picks another.
+
 ## Testing
 
 Tests are written in Python with pytest and run the built binary:
@@ -75,6 +92,7 @@ They need `pytest`, `requests`, `boto3`, `google-cloud-storage` and the
 | `src/s3/` | The S3 facade; see [docs/s3-protocol.md](docs/s3-protocol.md) |
 | `src/gcs/` | The GCS facade; see [docs/gcs-protocol.md](docs/gcs-protocol.md) |
 | `src/http_frontend.*` | Per-facade HTTP(S) servers on all shards |
+| `container/` | The container image |
 
 ## License
 

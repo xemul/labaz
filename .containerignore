@@ -1,0 +1,8 @@
+build
+**/build
+.git
+**/.git
+tags
+**/*.swp
+**/__pycache__
+docs/http-connection-migration.md

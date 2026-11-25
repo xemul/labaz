@@ -1,0 +1,34 @@
+# Copyright (C) 2026 The Labaz Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# A Labaz server: podman build -f container/Containerfile -t labaz .
+# (from the top of the tree, with the seastar submodule checked out).
+# See container/entrypoint.sh for how to run it.
+#
+# The build runs in ScyllaDB's toolchain image, which has Seastar's build
+# dependencies already (FIXME: a plain Fedora with seastar's
+# install-dependencies.sh, once downloading them is no problem).
+
+ARG BUILDER=docker.io/scylladb/scylla-toolchain:fedora-44-20261015
+
+FROM ${BUILDER} AS build
+
+RUN dnf install -y pugixml-devel && dnf clean all
+
+COPY . /src
+WORKDIR /src
+RUN cmake --preset release && ninja -C build/release labaz
+# The shared libraries the binary needs, but for glibc's, which every image
+# has; Seastar is linked in.
+RUN mkdir /libs && ldd build/release/labaz | awk '/=> \// { print $3 }' \
+        | grep -vE '/(libc|libm|libpthread|libdl|librt|ld-linux[^/]*)\.so' | xargs -I{} cp -L {} /libs/
+
+FROM registry.fedoraproject.org/fedora:44
+
+COPY --from=build /libs/ /usr/lib64/
+COPY --from=build /src/build/release/labaz /usr/bin/labaz
+COPY container/entrypoint.sh /usr/bin/labaz-entrypoint
+
+VOLUME /var/lib/labaz
+EXPOSE 7070 4443
+ENTRYPOINT ["/usr/bin/labaz-entrypoint"]
