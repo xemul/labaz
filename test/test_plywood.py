@@ -39,25 +39,12 @@ def test_no_such_bucket_for_session(plywood):
 
 # Objects
 
-def test_put_get(plywood):
+def test_put_reply(plywood):
+    """PUT replies with the object's info, whose generation reads report."""
     info = plywood.put("bkt", "key", b"hello", metadata={"Color": "red"})
-    assert info["key"] == "key"
-    assert info["size"] == 5
-    assert info["metadata"] == {"color": "red"}
-    r = plywood.get("bkt", "key")
-    assert r.content == b"hello"
-    assert r.headers["X-Labaz-Size"] == "5"
-    assert r.headers["X-Labaz-Generation"] == str(info["generation"])
-    assert r.headers["X-Labaz-Meta-color"] == "red"
-
-
-def test_head(plywood):
-    info = plywood.put("bkt", "key", b"hello", metadata={"m": "v"})
-    r = plywood.head("bkt", "key")
-    assert r.headers["X-Labaz-Size"] == "5"
-    assert r.headers["X-Labaz-Generation"] == str(info["generation"])
-    assert r.headers["X-Labaz-Meta-m"] == "v"
-    expect_error("", 404, plywood.head, "bkt", "nope")  # HEAD has no body
+    assert (info["key"], info["size"], info["metadata"]) == ("key", 5, {"color": "red"})
+    assert plywood.get("bkt", "key").headers["X-Labaz-Generation"] == str(info["generation"])
+    assert plywood.head("bkt", "key").headers["X-Labaz-Generation"] == str(info["generation"])
 
 
 def test_empty_session_object(plywood):
@@ -66,13 +53,10 @@ def test_empty_session_object(plywood):
     assert plywood.read("bkt", "empty2") == b""
 
 
-def test_overwrite(plywood):
-    g1 = plywood.put("bkt", "key", b"first", metadata={"v": "1"})["generation"]
-    g2 = plywood.put("bkt", "key", b"second!", metadata={"v": "2"})["generation"]
+def test_overwrite_bumps_generation(plywood):
+    g1 = plywood.put("bkt", "key", b"first")["generation"]
+    g2 = plywood.put("bkt", "key", b"second!")["generation"]
     assert g2 > g1
-    r = plywood.get("bkt", "key")
-    assert r.content == b"second!"
-    assert r.headers["X-Labaz-Meta-v"] == "2"
 
 
 def test_upload_kind(plywood):
@@ -116,9 +100,9 @@ def test_session_key_ending_with_slash(plywood, key):
 
 
 def test_list_reports_object_info(plywood):
-    plywood.put("bkt", "k", b"12345", metadata={"m": "v"})
-    [o] = plywood.list("bkt")["objects"]
-    assert (o["key"], o["size"], o["metadata"]) == ("k", 5, {"m": "v"})
+    """Listing reports what PUT replied with."""
+    info = plywood.put("bkt", "k", b"12345", metadata={"m": "v"})
+    assert plywood.list("bkt")["objects"] == [info]
 
 
 # Sessions
@@ -452,12 +436,12 @@ def test_copied_parts_in_object_checksums(plywood):
     assert plywood.read("bkt", "obj") == b"abc890123456789"
 
 
-def test_verify_object(plywood):
+def test_verify_object_digests(plywood):
+    """A PUT may verify several digests, and verifying one does not keep it."""
     data = b"payload"
     plywood.put("bkt", "obj", data, verify=digests(["crc32c", "sha1"], data))
-    expect_error("bad_digest", 400, plywood.put, "bkt", "obj", b"other", verify={"md5": digest("md5", data)})
-    assert plywood.read("bkt", "obj") == data
-    # Verifying does not make the storage keep the checksum.
+    expect_error("bad_digest", 400, plywood.put, "bkt", "obj", data,
+                 verify={"crc32c": digest("crc32c", data), "sha1": digest("sha1", b"other")})
     assert plywood.head("bkt", "obj").headers.get("X-Labaz-Checksum-crc32c") is None
 
 
@@ -496,7 +480,8 @@ def test_empty_bucket_in_path(plywood):
 
 # Persistence
 
-def test_objects_survive_restart(run_labaz, tmp_path):
+def test_object_info_survives_restart(run_labaz, tmp_path):
+    """Generations and kept checksums too."""
     data_dir = tmp_path / "data"
     port = free_port()
     args = ["--facade", f"plywood:http={port}", "--data-dir", str(data_dir)]
@@ -511,6 +496,4 @@ def test_objects_survive_restart(run_labaz, tmp_path):
 
     server.start()
     c = PlywoodClient(f"http://127.0.0.1:{port}")
-    assert c.list_buckets() == ["bkt"]
-    assert c.read("bkt", "a/b") == b"payload"
     assert c.list("bkt")["objects"] == [info, multi]

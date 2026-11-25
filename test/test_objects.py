@@ -483,6 +483,10 @@ def test_objects_survive_restart(run_labaz, tmp_path, facade):
     c = make_client(facade, f"http://127.0.0.1:{port}")
     c.create_bucket("bkt")
     c.put("bkt", "a/b", b"payload", metadata={"m": "v"})
+    u = c.open_upload("bkt", "a/c", metadata={"n": "w"})
+    c.upload_part("bkt", "a/c", u, 1, BIG)
+    c.upload_part("bkt", "a/c", u, 2, b"tail")
+    c.complete("bkt", "a/c", u, [1, 2])
     assert server.stop() == 0
 
     server.start()
@@ -490,3 +494,5 @@ def test_objects_survive_restart(run_labaz, tmp_path, facade):
     assert c.list_buckets() == ["bkt"]
     o = c.get("bkt", "a/b")
     assert (o.data, o.metadata) == (b"payload", {"m": "v"})
+    o = c.get("bkt", "a/c")
+    assert (o.data, o.metadata) == (BIG + b"tail", {"n": "w"})
