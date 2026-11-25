@@ -251,7 +251,101 @@ def test_bad_upload_type(gcs_url, gcs):
     assert error_of(r) == (400, "invalid")
 
 
-# Listing
+# Copies
+
+def test_rewrite(gcs):
+    """A copy is made in one call, and takes the source's metadata unless
+    given its own. Its checksums are of the data, also when the source is
+    a composite object, which has no MD5."""
+    data = os.urandom(RESUMABLE)
+    src = gcs.bucket("bkt").blob("src", chunk_size=16 * CHUNK)
+    src.metadata = {"m": "src"}
+    src.upload_from_string(data)
+    assert src.md5_hash is None
+    dst = gcs.bucket("bkt").blob("dst")
+    token, rewritten, size = dst.rewrite(src)
+    assert (token, rewritten, size) == (None, len(data), len(data))
+    assert (dst.metadata, dst.md5_hash, dst.crc32c) == ({"m": "src"}, b64(digest("md5", data)), src.crc32c)
+    dst = gcs.bucket("bkt").blob("dst")
+    dst.metadata = {"m": "dst"}
+    dst.rewrite(src)
+    assert gcs.bucket("bkt").get_blob("dst").metadata == {"m": "dst"}
+    assert dst.download_as_bytes() == data
+
+
+def test_copy_to(gcs):
+    src = gcs.bucket("bkt").blob("src")
+    src.metadata = {"m": "v"}
+    src.upload_from_string(b"data")
+    dst = gcs.bucket("bkt").copy_blob(src, gcs.bucket("bkt"), "dst")
+    assert (dst.name, dst.metadata, dst.download_as_bytes()) == ("dst", {"m": "v"}, b"data")
+    gcs.create_bucket("other")
+    with pytest.raises(gexc.GoogleAPICallError) as e:
+        gcs.bucket("bkt").copy_blob(src, gcs.bucket("other"), "dst")
+    assert e.value.code == 501
+
+
+def test_copy_conditions(gcs):
+    src = gcs.bucket("bkt").blob("src")
+    src.upload_from_string(b"data")
+    g = src.generation
+    dst = gcs.bucket("bkt").blob("dst")
+    dst.rewrite(src, if_source_generation_match=g, if_source_metageneration_match=1, if_generation_match=0)
+    for conditions in [{"if_source_generation_match": g + 1}, {"if_source_generation_not_match": g},
+                       {"if_source_metageneration_match": 2}, {"if_source_metageneration_not_match": 1},
+                       {"if_generation_match": 0}]:
+        with pytest.raises(gexc.PreconditionFailed):
+            gcs.bucket("bkt").blob("dst").rewrite(src, **conditions)
+    with pytest.raises(gexc.NotFound):
+        gcs.bucket("bkt").blob("dst").rewrite(gcs.bucket("bkt").blob("nope"))
+
+
+def test_rewrite_token(gcs_url, gcs):
+    gcs.bucket("bkt").blob("src").upload_from_string(b"data")
+    r = requests.post(f"{gcs_url}/storage/v1/b/bkt/o/src/rewriteTo/b/bkt/o/dst", params={"rewriteToken": "x"}, json={})
+    assert error_of(r) == (400, "invalid")
+
+
+def test_compose(gcs):
+    parts = [b"one", b"two", b"three"]
+    sources = []
+    for n, data in enumerate(parts):
+        b = gcs.bucket("bkt").blob(f"part{n}")
+        b.upload_from_string(data)
+        sources.append(b)
+    dst = gcs.bucket("bkt").blob("dst")
+    dst.metadata = {"m": "v"}
+    dst.compose(sources, if_source_generation_match=[b.generation for b in sources])
+    data = b"".join(parts)
+    assert (dst.size, dst.crc32c, dst.md5_hash, dst.metadata) == (len(data), b64(digest("crc32c", data)), None, {"m": "v"})
+    assert dst.download_as_bytes() == data
+    # A source may be used more than once, or be the destination itself.
+    dst.compose([dst, sources[0], sources[0]])
+    assert dst.download_as_bytes() == data + b"oneone"
+
+
+def test_compose_errors(gcs_url, gcs):
+    b = gcs.bucket("bkt").blob("a")
+    b.upload_from_string(b"a")
+    dst = gcs.bucket("bkt").blob("dst")
+    with pytest.raises(gexc.PreconditionFailed):
+        dst.compose([b], if_source_generation_match=[b.generation + 1])
+    with pytest.raises(gexc.NotFound):
+        dst.compose([b, gcs.bucket("bkt").blob("nope")])
+    dst.upload_from_string(b"old")
+    with pytest.raises(gexc.PreconditionFailed):
+        dst.compose([b], if_generation_match=0)
+    assert dst.download_as_bytes() == b"old"
+    url = f"{gcs_url}/storage/v1/b/bkt/o/dst/compose"
+    # There is no other version of a source to use.
+    r = requests.post(url, json={"sourceObjects": [{"name": "a", "generation": str(b.generation + 1)}]})
+    assert error_of(r) == (404, "notFound")
+    r = requests.post(url, json={"sourceObjects": [{"name": "a", "generation": str(b.generation)}]})
+    assert r.status_code == 200
+    assert error_of(requests.post(url, json={"sourceObjects": []})) == (400, "required")
+    assert error_of(requests.post(url, json={"sourceObjects": [{"name": "a"}] * 33})) == (400, "invalid")
+
+
 
 def test_list_delimiter(gcs):
     for k in ["a", "b/1", "b/2", "b/c/1", "c/1", "d"]:

@@ -13,6 +13,7 @@ has, and tests that need any of them skip the others:
 - "parts": parts that may come in any order, be sent again or left out,
   and be listed; GCS's resumable uploads append chunks in order.
 - "copy": copies of objects.
+- "parts" with "copy": parts copied from objects.
 - "head": HEAD requests (GCS's JSON API has none)."""
 
 import base64
@@ -312,7 +313,7 @@ class GcsFacade:
     chunks are sent as such (the library has no call for one chunk), and
     whose parts must come in order."""
     name = "gcs"
-    features = set()
+    features = {"copy"}
 
     def __init__(self, url: str):
         self.url = url
@@ -380,6 +381,13 @@ class GcsFacade:
 
     def delete(self, bucket, key):
         self._call(self._blob(bucket, key).delete)
+
+    def copy(self, bucket, key, src_key, metadata: dict | None = None, must_not_exist: bool = False):
+        """With rewriteTo, as ScyllaDB copies."""
+        dst = self._blob(bucket, key)
+        if metadata is not None:
+            dst.metadata = metadata
+        self._call(dst.rewrite, self._blob(bucket, src_key), if_generation_match=0 if must_not_exist else None)
 
     def list(self, bucket, prefix="", start_after="", max_keys=None) -> tuple[list[dict], bool]:
         # startOffset is where to start from, the key included.

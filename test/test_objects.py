@@ -425,10 +425,13 @@ def test_copy_missing_source(client):
     requires(client, "copy")
     expect_error(client, "no_such_key", client.copy, "bkt", "dst", "nope")
     expect_error(client, "no_such_key", client.read, "bkt", "dst")
-    u = client.open_upload("bkt", "dst")
-    expect_error(client, "no_such_key", client.copy_part, "bkt", "dst", u, 1, "nope")
-    assert client.list_parts("bkt", "dst", u) == []
-    expect_error(client, "invalid_argument", client.copy, "bkt", "dst", "")
+    if "parts" in client.features:
+        u = client.open_upload("bkt", "dst")
+        expect_error(client, "no_such_key", client.copy_part, "bkt", "dst", u, 1, "nope")
+        assert client.list_parts("bkt", "dst", u) == []
+    # GCS names objects in paths, where an empty name is no name.
+    if client.name != "gcs":
+        expect_error(client, "invalid_argument", client.copy, "bkt", "dst", "")
 
 
 def test_copy_parts(client):
@@ -447,7 +450,7 @@ def test_copy_parts(client):
 
 
 def test_copy_part_dropped_on_abort(client, tmp_path):
-    requires(client, "copy")
+    requires(client, "copy", "parts")
     client.put("bkt", "src", b"payload")
     u = client.open_upload("bkt", "dst")
     client.copy_part("bkt", "dst", u, 1, "src")

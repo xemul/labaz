@@ -39,6 +39,7 @@ namespace bpo = boost::program_options;
 static logger gcslog("gcs");
 
 static constexpr unsigned max_list_results = 1000;
+static constexpr unsigned max_compose_sources = 32;
 static constexpr size_t max_name_length = 1024;
 // Every chunk of a resumable upload but the last is a multiple of it.
 static constexpr uint64_t chunk_granularity = 256 << 10;
@@ -261,28 +262,36 @@ static void check_read_conditions(const request& req, const object_info& info) {
 // What an upload request's JSON object resource says, of what is kept.
 struct object_resource {
     sstring name;
+    // Whether the resource has metadata, which a copy takes from its
+    // source otherwise.
+    bool has_metadata = false;
     user_metadata metadata;
     // The data's checksums, which it must have.
     checksums expected;
 };
 
-static object_resource parse_object_resource(std::string_view body) {
-    object_resource ret;
-    if (body.empty()) {
-        return ret;
-    }
+static rapidjson::Document parse_json(std::string_view body) {
     rapidjson::Document doc;
     doc.Parse(body.data(), body.size());
     if (doc.HasParseError() || !doc.IsObject()) {
         throw invalid("Invalid JSON payload received.");
     }
-    if (auto it = doc.FindMember("name"); it != doc.MemberEnd()) {
+    return doc;
+}
+
+static object_resource to_object_resource(const rapidjson::Value& doc) {
+    object_resource ret;
+    if (!doc.IsObject()) {
+        throw invalid("Invalid value for an object resource");
+    }
+    if (auto it = doc.FindMember("name"); it != doc.MemberEnd() && !it->value.IsNull()) {
         if (!it->value.IsString()) {
             throw invalid("Invalid value for name");
         }
         ret.name = sstring(it->value.GetString(), it->value.GetStringLength());
     }
     if (auto it = doc.FindMember("metadata"); it != doc.MemberEnd() && !it->value.IsNull()) {
+        ret.has_metadata = true;
         if (!it->value.IsObject()) {
             throw invalid("Invalid value for metadata");
         }
@@ -298,7 +307,7 @@ static object_resource parse_object_resource(std::string_view body) {
         }
     }
     for (auto [member, alg] : {std::pair{"md5Hash", checksum_algorithm::md5}, std::pair{"crc32c", checksum_algorithm::crc32c}}) {
-        if (auto it = doc.FindMember(member); it != doc.MemberEnd()) {
+        if (auto it = doc.FindMember(member); it != doc.MemberEnd() && !it->value.IsNull()) {
             auto value = it->value.IsString() ? from_base64(it->value.GetString()) : std::nullopt;
             if (!value) {
                 throw invalid(fmt::format("Invalid value for {}", member));
@@ -307,6 +316,13 @@ static object_resource parse_object_resource(std::string_view body) {
         }
     }
     return ret;
+}
+
+static object_resource parse_object_resource(std::string_view body) {
+    if (body.empty()) {
+        return {};
+    }
+    return to_object_resource(parse_json(body));
 }
 
 // The name of the object an upload request is for: the name parameter, or
@@ -433,7 +449,8 @@ static void write_object(json_writer& w, const request& req, std::string_view bu
     field(w, "storageClass", "STANDARD");
     field(w, "size", fmt::to_string(info.size));
     auto sums = object_checksums(info);
-    if (auto it = sums.find(checksum_algorithm::md5); it != sums.end()) {
+    // An object of several parts (chunks, or composed) is a composite one.
+    if (auto it = sums.find(checksum_algorithm::md5); it != sums.end() && info.upload == upload_kind::single) {
         field(w, "md5Hash", to_base64(it->second));
     }
     if (auto it = sums.find(checksum_algorithm::crc32c); it != sums.end()) {
@@ -552,6 +569,12 @@ public:
         r.add(object_rule("/storage/v1/b", &gcs_facade::delete_object), DELETE);
         r.add(object_rule("/download/storage/v1/b", &gcs_facade::download_object), GET);
 
+        r.add(&object_rule("/storage/v1/b", &gcs_facade::rewrite_object)->add_str("/rewriteTo/b").add_param("dbucket", false)
+              .add_str("/o").add_param("dobject", false), POST);
+        r.add(&object_rule("/storage/v1/b", &gcs_facade::copy_object)->add_str("/copyTo/b").add_param("dbucket", false)
+              .add_str("/o").add_param("dobject", false), POST);
+        r.add(&object_rule("/storage/v1/b", &gcs_facade::compose_object)->add_str("/compose"), POST);
+
         r.add(&bucket_rule("/upload/storage/v1/b", &gcs_facade::insert_object)->add_str("/o"), POST);
         r.add(&bucket_rule("/upload/storage/v1/b", &gcs_facade::upload_chunk)->add_str("/o"), PUT);
         r.add(&bucket_rule("/upload/storage/v1/b", &gcs_facade::cancel_upload)->add_str("/o"), DELETE);
@@ -639,12 +662,7 @@ private:
         if (req.get_query_param("project").empty()) {
             throw required("parameter: project");
         }
-        auto body = co_await util::read_entire_stream_contiguous(*req.content_stream);
-        rapidjson::Document doc;
-        doc.Parse(body.data(), body.size());
-        if (doc.HasParseError() || !doc.IsObject()) {
-            throw invalid("Invalid JSON payload received.");
-        }
+        auto doc = parse_json(co_await util::read_entire_stream_contiguous(*req.content_stream));
         auto it = doc.FindMember("name");
         if (it == doc.MemberEnd() || !it->value.IsString()) {
             throw required("field: name");
@@ -798,6 +816,182 @@ private:
                                   "ifMetagenerationNotMatch"});
         co_await _storage.delete_object(bucket_param(req), object_param(req));
         co_return empty_reply(std::move(rep), status::no_content);
+    }
+
+    // Copies
+
+    // rewriteTo copies all at once, so it is always done, and gives no
+    // rewriteToken to continue with.
+    future<std::unique_ptr<reply>> rewrite_object(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("rewriteToken")) {
+            throw invalid("Invalid rewriteToken");
+        }
+        auto [bucket, info] = co_await copy(req);
+        co_return json_reply(std::move(rep), [&] (json_writer& w) {
+            w.StartObject();
+            field(w, "kind", "storage#rewriteResponse");
+            field(w, "totalBytesRewritten", fmt::to_string(info.size));
+            field(w, "objectSize", fmt::to_string(info.size));
+            w.Key("done"); w.Bool(true);
+            w.Key("resource"); write_object(w, req, bucket, info);
+            w.EndObject();
+        });
+    }
+
+    future<std::unique_ptr<reply>> copy_object(request& req, std::unique_ptr<reply> rep) {
+        auto [bucket, info] = co_await copy(req);
+        co_return json_reply(std::move(rep), [&] (json_writer& w) { write_object(w, req, bucket, info); });
+    }
+
+    // Copies {bucket}/o/{object} to {dbucket}/o/{dobject}, a new object of
+    // the source's data and, unless the request's resource has some, its
+    // metadata. The copy is of the source's version that the conditions
+    // hold for, and is made again if the source changes meanwhile.
+    future<std::pair<sstring, object_info>> copy(request& req) {
+        reject_query_params(req, {"destinationKmsKeyName", "destinationPredefinedAcl"});
+        auto bucket = bucket_param(req);
+        auto src = object_param(req);
+        auto dst = req.get_path_param("dobject");
+        check_object_name(dst);
+        if (req.get_path_param("dbucket") != bucket) {
+            throw not_implemented("Copying to another bucket");
+        }
+        auto pre = write_precondition(req);
+        auto res = parse_object_resource(co_await util::read_entire_stream_contiguous(*req.content_stream));
+        if (!res.expected.empty()) {
+            throw not_implemented("Checksums of a copy");
+        }
+        for (;;) {
+            auto src_info = co_await _storage.head_object(bucket, src);
+            check_source_conditions(req, src_info);
+            auto attrs = upload_attrs(res.has_metadata ? res.metadata : src_info.attrs.metadata);
+            auto id = co_await _storage.open_session(bucket, dst, std::move(attrs));
+            bool copied = false;
+            std::exception_ptr ex;
+            try {
+                co_await _storage.copy_part(bucket, dst, id, 1, src, std::nullopt, precondition{src_info.generation});
+                copied = true;
+                co_return std::pair(bucket, co_await _storage.commit_session(bucket, dst, id, {1}, pre, upload_kind::single));
+            } catch (...) {
+                ex = std::current_exception();
+            }
+            // Report the original error, not a failure to clean up after it.
+            auto f = co_await coroutine::as_future(_storage.abort_session(bucket, dst, id));
+            f.ignore_ready_future();
+            // The source changed after its conditions were checked: check
+            // them against its new version.
+            if (copied || !is_storage_error(ex, errc::precondition_failed)) {
+                std::rethrow_exception(ex);
+            }
+        }
+    }
+
+    // Any of a copy's conditions on its source failing fails it with 412.
+    // There are no other versions of the source to copy.
+    static void check_source_conditions(const request& req, const object_info& info) {
+        if (auto g = query_number(req, "sourceGeneration"); g && *g != info.generation) {
+            throw storage_error(errc::no_such_key, "");
+        }
+        auto gen_match = query_number(req, "ifSourceGenerationMatch");
+        auto gen_not_match = query_number(req, "ifSourceGenerationNotMatch");
+        auto meta_match = query_number(req, "ifSourceMetagenerationMatch");
+        auto meta_not_match = query_number(req, "ifSourceMetagenerationNotMatch");
+        if ((gen_match && *gen_match != info.generation) || (gen_not_match && *gen_not_match == info.generation)
+                || (meta_match && *meta_match != 1) || (meta_not_match && *meta_not_match == 1)) {
+            throw storage_error(errc::precondition_failed, "");
+        }
+    }
+
+    // A composite object of up to 32 objects of the bucket, in order.
+    future<std::unique_ptr<reply>> compose_object(request& req, std::unique_ptr<reply> rep) {
+        reject_query_params(req, {"kmsKeyName", "destinationPredefinedAcl"});
+        auto bucket = bucket_param(req);
+        auto dst = object_param(req);
+        auto pre = write_precondition(req);
+        auto doc = parse_json(co_await util::read_entire_stream_contiguous(*req.content_stream));
+
+        // Of the destination's resource only the metadata is used: clients
+        // send what they know of the object, its old checksums included.
+        object_resource res;
+        if (auto it = doc.FindMember("destination"); it != doc.MemberEnd()) {
+            res = to_object_resource(it->value);
+        }
+        // A source's generation, given or required, is that it must have.
+        struct source {
+            sstring name;
+            std::optional<uint64_t> generation;
+            std::optional<uint64_t> generation_match;
+        };
+        std::vector<source> sources;
+        auto it = doc.FindMember("sourceObjects");
+        if (it == doc.MemberEnd() || !it->value.IsArray() || it->value.Empty()) {
+            throw required("field: sourceObjects");
+        }
+        if (it->value.Size() > max_compose_sources) {
+            throw invalid(fmt::format("The number of source components provided ({}) exceeds the maximum ({})",
+                                      it->value.Size(), max_compose_sources));
+        }
+        auto generation_of = [] (const rapidjson::Value& v, const char* member) -> std::optional<uint64_t> {
+            auto m = v.FindMember(member);
+            if (m == v.MemberEnd() || m->value.IsNull()) {
+                return std::nullopt;
+            }
+            if (m->value.IsUint64()) {
+                return m->value.GetUint64();
+            }
+            if (m->value.IsString()) {
+                return parse_number<uint64_t>(m->value.GetString(), member);
+            }
+            throw invalid(fmt::format("Invalid value for {}", member));
+        };
+        for (auto& s : it->value.GetArray()) {
+            auto name = s.IsObject() ? s.FindMember("name") : s.MemberEnd();
+            if (!s.IsObject() || name == s.MemberEnd() || !name->value.IsString()) {
+                throw required("field: sourceObjects.name");
+            }
+            source src{sstring(name->value.GetString(), name->value.GetStringLength()), generation_of(s, "generation"), {}};
+            check_object_name(src.name);
+            if (auto p = s.FindMember("objectPreconditions"); p != s.MemberEnd()) {
+                if (!p->value.IsObject()) {
+                    throw invalid("Invalid value for objectPreconditions");
+                }
+                src.generation_match = generation_of(p->value, "ifGenerationMatch");
+            }
+            sources.push_back(std::move(src));
+        }
+
+        auto id = co_await _storage.open_session(bucket, dst, upload_attrs(std::move(res.metadata)));
+        object_info info;
+        std::exception_ptr ex;
+        try {
+            std::vector<unsigned> numbers;
+            for (auto& src : sources) {
+                numbers.push_back(numbers.size() + 1);
+                if (src.generation && src.generation_match && *src.generation != *src.generation_match) {
+                    throw storage_error(errc::precondition_failed, "");
+                }
+                auto f = co_await coroutine::as_future(_storage.copy_part(bucket, dst, id, numbers.back(), src.name, std::nullopt,
+                                                                          precondition{src.generation_match ? src.generation_match : src.generation}));
+                if (f.failed()) {
+                    auto e = f.get_exception();
+                    // There is no other version of the source to read.
+                    if (!src.generation_match && is_storage_error(e, errc::precondition_failed)) {
+                        throw storage_error(errc::no_such_key, "");
+                    }
+                    std::rethrow_exception(e);
+                }
+            }
+            info = co_await _storage.commit_session(bucket, dst, id, std::move(numbers), pre, upload_kind::multipart);
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        if (ex) {
+            // Report the original error, not a failure to clean up after it.
+            auto f = co_await coroutine::as_future(_storage.abort_session(bucket, dst, id));
+            f.ignore_ready_future();
+            std::rethrow_exception(ex);
+        }
+        co_return json_reply(std::move(rep), [&] (json_writer& w) { write_object(w, req, bucket, info); });
     }
 
     // Uploads
