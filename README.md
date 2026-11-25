@@ -66,7 +66,7 @@ They need `pytest`, `requests`, `boto3`, `google-cloud-storage` and the
 | `src/storage.*` | The storage interface, routing calls to the owner shard, and neutral error codes |
 | `src/facade.hh` | The facade (protocol) interface |
 | `src/sharder.*` | Which shard owns an object |
-| `src/streams.*` | Reading streams of other shards, and of memory |
+| `src/streams.*` | Reading streams of other shards |
 | `src/checksum.*` | Checksums, and their hex and base64 forms |
 | `src/http_util.*`, `src/listing.*` | What the S3 and GCS facades share: URL encoding, dates, `Range` headers, listings with a delimiter |
 | `src/registry.cc` | The list of built-in backends and facades |

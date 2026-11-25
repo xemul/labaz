@@ -7,7 +7,6 @@
 
 #include <seastar/core/deleter.hh>
 #include <seastar/core/iostream.hh>
-#include <seastar/core/temporary_buffer.hh>
 
 namespace labaz {
 
@@ -17,8 +16,5 @@ namespace labaz {
 /// destroyed. Closing the stream closes `in` on its shard. `keep` is
 /// destroyed with the stream, so it can keep `in` alive.
 seastar::input_stream<char> make_foreign_stream(unsigned owner, seastar::input_stream<char>& in, seastar::deleter keep);
-
-/// A stream yielding `data`, then its end.
-seastar::input_stream<char> make_buffer_stream(seastar::temporary_buffer<char> data);
 
 } // namespace labaz

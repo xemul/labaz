@@ -54,23 +54,4 @@ input_stream<char> make_foreign_stream(unsigned owner, input_stream<char>& in, d
     return input_stream<char>(data_source(std::make_unique<foreign_source>(owner, in, std::move(keep))));
 }
 
-namespace {
-
-class buffer_source final : public data_source_impl {
-    temporary_buffer<char> _data;
-
-public:
-    explicit buffer_source(temporary_buffer<char> data) : _data(std::move(data)) {}
-
-    future<temporary_buffer<char>> get() override {
-        return make_ready_future<temporary_buffer<char>>(std::exchange(_data, temporary_buffer<char>()));
-    }
-};
-
-}
-
-input_stream<char> make_buffer_stream(temporary_buffer<char> data) {
-    return input_stream<char>(data_source(std::make_unique<buffer_source>(std::move(data))));
-}
-
 } // namespace labaz

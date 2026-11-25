@@ -21,6 +21,7 @@
 #include <seastar/http/handlers.hh>
 #include <seastar/http/matchrules.hh>
 #include <seastar/util/log.hh>
+#include <seastar/util/memory-data-source.hh>
 #include <seastar/util/short_streams.hh>
 
 #include "http_util.hh"
@@ -831,7 +832,7 @@ private:
         auto res = parse_object_resource(resource);
         auto bucket = bucket_param(req);
         auto name = upload_name(req, res);
-        auto buffered = make_buffer_stream(temporary_buffer<char>(data.data(), data.size()));
+        auto buffered = util::as_input_stream(temporary_buffer<char>(data.data(), data.size()));
         object_info info;
         if (res.expected.empty()) {
             info = co_await upload_single(bucket, name, upload_attrs(std::move(res.metadata)), pre, buffered);
