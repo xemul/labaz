@@ -103,6 +103,13 @@ class PlywoodClient:
     def delete(self, bucket: str, key: str):
         self.request("DELETE", self._obj(bucket, key))
 
+    def update_attrs(self, bucket: str, key: str, metadata: dict | None = None, tags: dict | None = None,
+                     generation_match: int | None = None) -> dict:
+        """Replaces the given attributes in place; returns the object info."""
+        body = {name: value for name, value in [("metadata", metadata), ("tags", tags)] if value is not None}
+        headers = {} if generation_match is None else {"X-Labaz-If-Generation-Match": str(generation_match)}
+        return self.request("PUT", self._obj(bucket, key), params={"attrs": ""}, json=body, headers=headers).json()
+
     def list(self, bucket: str, prefix: str = "", start_after: str = "",
              max_keys: int | None = None) -> dict:
         params = {"prefix": prefix, "start-after": start_after}

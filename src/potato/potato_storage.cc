@@ -198,6 +198,12 @@ static sstring serialize(const object_meta& m) {
         str(k); str(v);
     }
     w.EndObject();
+    w.Key("tags");
+    w.StartObject();
+    for (auto& [k, v] : m.info.attrs.tags) {
+        str(k); str(v);
+    }
+    w.EndObject();
     w.Key("checksums");
     w.StartArray();
     for (auto alg : m.info.attrs.checksums) {
@@ -257,6 +263,9 @@ static object_meta deserialize(std::string_view s) {
     };
     for (auto& kv : d["metadata"].GetObject()) {
         m.info.attrs.metadata.emplace(str(kv.name), str(kv.value));
+    }
+    for (auto& kv : d["tags"].GetObject()) {
+        m.info.attrs.tags.emplace(str(kv.name), str(kv.value));
     }
     for (auto& a : d["checksums"].GetArray()) {
         m.info.attrs.checksums.insert(algorithm(str(a)));
@@ -595,6 +604,22 @@ public:
         co_await remove_if_empty(dir);
     }
 
+    future<object_info> update_object(sstring bucket, sstring key, attrs_update update, precondition pre) override {
+        auto lock = co_await _lock.hold_write_lock();
+        auto m = co_await load_meta(bucket, key);
+        if (pre.generation_match && *pre.generation_match != m.info.generation) {
+            fail(errc::precondition_failed, fmt::format("generation is {}, not {}", m.info.generation, *pre.generation_match));
+        }
+        if (update.metadata) {
+            m.info.attrs.metadata = std::move(*update.metadata);
+        }
+        if (update.tags) {
+            m.info.attrs.tags = std::move(*update.tags);
+        }
+        co_await write_meta(object_dir(bucket, key), m);
+        co_return m.info;
+    }
+
     future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) override {
         validate_bucket_name(bucket);
         co_await check_bucket(bucket);
@@ -843,6 +868,14 @@ private:
         co_return found;
     }
 
+    // Replaces the object's meta atomically. Runs under the write lock.
+    future<> write_meta(const fs::path& dir, const object_meta& m) {
+        auto path = dir / meta_name;
+        auto tmp = fs::path(fmt::format("{}.{:x}.tmp", path.native(), next_unique()));
+        co_await write_small_file(tmp, serialize(m));
+        co_await rename_file(tmp.native(), path.native());
+    }
+
     // Runs under the write lock.
     future<object_info> publish(const session_id& id, session_state& st, object_meta m, const std::set<unsigned>& listed,
                                 precondition pre) {
@@ -869,11 +902,7 @@ private:
         m.info.key = st.key;
         m.info.mtime = clock_type::now();
         m.info.attrs = st.attrs;
-
-        auto path = dir / meta_name;
-        auto tmp = fs::path(fmt::format("{}.{:x}.tmp", path.native(), m.info.generation));
-        co_await write_small_file(tmp, serialize(m));
-        co_await rename_file(tmp.native(), path.native());
+        co_await write_meta(dir, m);
 
         if (old) {
             co_await recursive_remove_directory(dir / old->data_dir.c_str());

@@ -54,11 +54,13 @@ public:
 };
 
 using user_metadata = std::map<sstring, sstring>;
+using object_tags = std::map<sstring, sstring>;
 using clock_type = std::chrono::system_clock;
 
 /// Attributes given when an upload starts and stored with the object.
 struct object_attrs {
     user_metadata metadata;
+    object_tags tags;
     // Computed for every part.
     std::set<checksum_algorithm> checksums;
 };
@@ -137,6 +139,12 @@ struct resolved_range {
 /// range.
 resolved_range resolve_range(const byte_range& r, uint64_t size);
 
+/// The attributes update_object() replaces: those given.
+struct attrs_update {
+    std::optional<user_metadata> metadata;
+    std::optional<object_tags> tags;
+};
+
 struct object_reader {
     // The version being read; resolve_range(range, info.size) gives the
     // bytes `data` yields.
@@ -192,6 +200,7 @@ protected:
     virtual future<object_info> head_object(sstring bucket, sstring key) = 0;
     virtual future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range) = 0;
     virtual future<> delete_object(sstring bucket, sstring key) = 0;
+    virtual future<object_info> update_object(sstring bucket, sstring key, attrs_update update, precondition pre) = 0;
     virtual future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys) = 0;
 
     inline unsigned owner_of(std::string_view bucket, std::string_view key) const;
@@ -273,6 +282,10 @@ public:
     future<object_info> head_object(sstring bucket, sstring key);
     future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range);
     future<> delete_object(sstring bucket, sstring key);
+    /// Replaces the attributes of the object's current version that the
+    /// update has, in place: the data, the generation and the modification
+    /// time stay. `pre` is checked against that version.
+    future<object_info> update_object(sstring bucket, sstring key, attrs_update update, precondition pre);
     /// Keys in byte order, starting after `start_after`.
     future<listing> list_objects(sstring bucket, sstring prefix, sstring start_after, unsigned max_keys);
 };

@@ -105,6 +105,34 @@ def test_list_reports_object_info(plywood):
     assert plywood.list("bkt")["objects"] == [info]
 
 
+def test_update_attrs(plywood):
+    """Attributes are replaced in place: the data, the generation and the
+    modification time stay, and so do the attributes not given."""
+    info = plywood.put("bkt", "k", b"data", metadata={"m": "v"})
+    assert info["tags"] == {}
+    t = plywood.update_attrs("bkt", "k", tags={"a": "1", "B": "2"})
+    assert (t["tags"], t["metadata"]) == ({"a": "1", "B": "2"}, {"m": "v"})
+    assert {k: t[k] for k in ("generation", "mtime_ns", "size", "checksums")} == \
+           {k: info[k] for k in ("generation", "mtime_ns", "size", "checksums")}
+    m = plywood.update_attrs("bkt", "k", metadata={"n": "w"}, generation_match=info["generation"])
+    assert (m["tags"], m["metadata"]) == ({"a": "1", "B": "2"}, {"n": "w"})
+    assert plywood.update_attrs("bkt", "k", tags={})["tags"] == {}
+    assert plywood.read("bkt", "k") == b"data"
+    assert plywood.list("bkt")["objects"] == [plywood.update_attrs("bkt", "k")]
+
+
+def test_update_attrs_errors(plywood):
+    info = plywood.put("bkt", "k", b"data")
+    expect_error("precondition_failed", 412, plywood.update_attrs, "bkt", "k", tags={"a": "1"},
+                 generation_match=info["generation"] + 1)
+    expect_error("no_such_key", 404, plywood.update_attrs, "bkt", "nope", tags={})
+    expect_error("no_such_bucket", 404, plywood.update_attrs, "nope", "k", tags={})
+    for body in ["[]", '{"tags": []}', '{"metadata": {"a": 1}}', "nope"]:
+        expect_error("bad_request", 400, plywood.request, "PUT", "/bkt/k", params={"attrs": ""}, data=body)
+    expect_error("bad_request", 400, plywood.request, "PUT", "/bkt/k", params={"attrs": "", "copy-key": "k"}, json={})
+    assert plywood.put("bkt", "k", b"new")["tags"] == {}  # a new version has none
+
+
 # Sessions
 
 def test_session_of_small_parts(plywood):
@@ -481,14 +509,15 @@ def test_empty_bucket_in_path(plywood):
 # Persistence
 
 def test_object_info_survives_restart(run_labaz, tmp_path):
-    """Generations and kept checksums too."""
+    """Generations, tags and kept checksums too."""
     data_dir = tmp_path / "data"
     port = free_port()
     args = ["--facade", f"plywood:http={port}", "--data-dir", str(data_dir)]
     server = run_labaz(args)
     c = PlywoodClient(f"http://127.0.0.1:{port}")
     c.create_bucket("bkt")
-    info = c.put("bkt", "a/b", b"payload", metadata={"m": "v"}, checksums=["crc32c", "md5"])
+    c.put("bkt", "a/b", b"payload", metadata={"m": "v"}, checksums=["crc32c", "md5"])
+    info = c.update_attrs("bkt", "a/b", tags={"t": "1"})
     s = c.open_session("bkt", "a/c")
     c.put_part("bkt", "a/c", s, 1, b"part")
     multi = c.commit("bkt", "a/c", s)

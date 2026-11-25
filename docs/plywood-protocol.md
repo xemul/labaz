@@ -34,7 +34,7 @@ A request that matches no route gets Seastar's own 404 reply.
 ## Objects
 
 An object info is
-`{"key", "size", "generation", "multipart", "mtime_ns", "metadata": {}, "checksums": {}, "parts": [part info]}`,
+`{"key", "size", "generation", "multipart", "mtime_ns", "metadata": {}, "tags": {}, "checksums": {}, "parts": [part info]}`,
 and a part info is `{"number", "size", "checksums": {}}`. `multipart` is false
 for an object made by a `PUT` (a copy included) and true for one committed
 from a session, whatever its number of parts.
@@ -45,6 +45,9 @@ from a session, whatever its number of parts.
 | `GET /{bucket}/{key}` | the data; 206 with `Content-Range` if a `Range: bytes=...` header was given (single range only). Headers `X-Labaz-Size`, `X-Labaz-Generation`, `X-Labaz-Meta-<name>`, `X-Labaz-Checksum-<algorithm>` |
 | `HEAD /{bucket}/{key}` | the same headers, no body |
 | `DELETE /{bucket}/{key}` | 204 |
+| `PUT /{bucket}/{key}?attrs` | object info. The JSON body `{"metadata": {}, "tags": {}}` replaces the attributes it has, in place: the data, generation and `mtime_ns` stay. Optional `X-Labaz-If-Generation-Match` |
+
+Objects are made with no tags; `?attrs` is the only way to set them.
 
 A `PUT` is a one-part session committed at once.
 

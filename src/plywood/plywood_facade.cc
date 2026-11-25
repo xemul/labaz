@@ -12,6 +12,7 @@
 
 #include <fmt/format.h>
 
+#include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
@@ -19,6 +20,7 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/matchrules.hh>
+#include <seastar/util/short_streams.hh>
 
 namespace labaz::plywood {
 
@@ -77,7 +79,7 @@ static void write_string(json_writer& w, std::string_view s) {
     w.String(s.data(), s.size());
 }
 
-static void write_metadata(json_writer& w, const user_metadata& md) {
+static void write_map(json_writer& w, const std::map<sstring, sstring>& md) {
     w.StartObject();
     for (auto& [k, v] : md) {
         write_string(w, k);
@@ -110,7 +112,8 @@ static void write_object_info(json_writer& w, const object_info& info) {
     w.Key("generation"); w.Uint64(info.generation);
     w.Key("multipart"); w.Bool(info.upload == upload_kind::multipart);
     w.Key("mtime_ns"); w.Int64(std::chrono::duration_cast<std::chrono::nanoseconds>(info.mtime.time_since_epoch()).count());
-    w.Key("metadata"); write_metadata(w, info.attrs.metadata);
+    w.Key("metadata"); write_map(w, info.attrs.metadata);
+    w.Key("tags"); write_map(w, info.attrs.tags);
     w.Key("checksums"); write_checksums(w, object_checksums(info));
     w.Key("parts");
     w.StartArray();
@@ -467,6 +470,12 @@ private:
     }
 
     future<std::unique_ptr<reply>> put_object_or_session(request& req, std::unique_ptr<reply> rep) {
+        if (req.has_query_param("attrs")) {
+            if (req.has_query_param("session") || req.has_query_param("part") || req.has_query_param("copy-key")) {
+                throw bad_request("'attrs' goes alone");
+            }
+            return update_object(req, std::move(rep));
+        }
         bool copy = is_copy_request(req, true);
         if (is_session_request(req, true)) {
             return copy ? copy_session(req, std::move(rep)) : put_session(req, std::move(rep));
@@ -550,6 +559,38 @@ private:
         co_return empty_reply(std::move(rep));
     }
 
+    // Replaces the attributes the JSON body has: {"metadata": {}, "tags": {}}.
+    future<std::unique_ptr<reply>> update_object(request& req, std::unique_ptr<reply> rep) {
+        auto body = co_await util::read_entire_stream_contiguous(*req.content_stream);
+        rapidjson::Document doc;
+        doc.Parse(body.data(), body.size());
+        if (doc.HasParseError() || !doc.IsObject()) {
+            throw bad_request("the body is not a JSON object");
+        }
+        auto map_of = [&doc] (const char* name) -> std::optional<std::map<sstring, sstring>> {
+            auto it = doc.FindMember(name);
+            if (it == doc.MemberEnd()) {
+                return std::nullopt;
+            }
+            if (!it->value.IsObject()) {
+                throw bad_request(fmt::format("'{}' is not an object", name));
+            }
+            std::map<sstring, sstring> ret;
+            for (auto& m : it->value.GetObject()) {
+                if (!m.value.IsString()) {
+                    throw bad_request(fmt::format("'{}' has a value that is not a string", name));
+                }
+                ret.emplace(sstring(m.name.GetString(), m.name.GetStringLength()),
+                            sstring(m.value.GetString(), m.value.GetStringLength()));
+            }
+            return ret;
+        };
+        attrs_update update{map_of("metadata"), map_of("tags")};
+        auto info = co_await _storage.update_object(bucket_param(req), key_param(req), std::move(update),
+                                                    precondition_from_headers(req));
+        co_return json_reply(std::move(rep), [&] (json_writer& w) { write_object_info(w, info); });
+    }
+
     // Sessions
 
     future<std::unique_ptr<reply>> open_session(request& req, std::unique_ptr<reply> rep) {
@@ -568,7 +609,7 @@ private:
             w.Key("session"); write_string(w, info.id);
             w.Key("bucket"); write_string(w, info.bucket);
             w.Key("key"); write_string(w, info.key);
-            w.Key("metadata"); write_metadata(w, info.attrs.metadata);
+            w.Key("metadata"); write_map(w, info.attrs.metadata);
             w.Key("checksums");
             w.StartArray();
             for (auto alg : info.attrs.checksums) {

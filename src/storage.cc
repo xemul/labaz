@@ -155,6 +155,12 @@ future<> storage_service::delete_object(sstring bucket, sstring key) {
     });
 }
 
+future<object_info> storage_service::update_object(sstring bucket, sstring key, attrs_update update, precondition pre) {
+    return invoke_on(owner_of(bucket, key), [bucket, key, update = std::move(update), pre] (storage& s) mutable {
+        return s.update_object(bucket, key, std::move(update), pre);
+    });
+}
+
 namespace {
 
 // A reader whose stream stays on the shard that made it.
