@@ -849,14 +849,15 @@ def test_put_tagging_errors(s3_url, s3, body, code):
     assert tags_of(s3, "k") == {"keep": "1"}
 
 
-def test_put_tagging_needs_checksum(s3_url, s3):
-    """As S3's API says, although some S3 servers do without."""
+def test_put_tagging_checksum(s3_url, s3):
+    """A checksum of the body is verified, but not required, as ScyllaDB's
+    client sends none."""
     s3.put_object(Bucket="bkt", Key="k", Body=b"x")
     body = tagging_xml("<Tag><Key>a</Key><Value>1</Value></Tag>")
-    r = put_tagging(s3_url, body, {})
-    assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "InvalidRequest")
     r = put_tagging(s3_url, body, {"Content-MD5": b64(hashlib.md5(b"x").hexdigest())})
     assert (r.status_code, ET.fromstring(r.content).find("Code").text) == (400, "BadDigest")
+    assert tags_of(s3, "k") == {}
+    assert put_tagging(s3_url, body, {}).status_code == 200
     assert put_tagging(s3_url, body).status_code == 200
     r = requests.get(f"{s3_url}/bkt/k?tagging")
     root = ET.fromstring(r.content)

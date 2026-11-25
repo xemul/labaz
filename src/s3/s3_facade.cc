@@ -536,13 +536,16 @@ static void check_plain_body(const request& req) {
     }
 }
 
-// The body of a request that S3 wants a Content-MD5 or a checksum of,
-// verified against it.
-static future<sstring> read_checksummed_body(request& req) {
+// The body of a request, verified against its Content-MD5 or checksum,
+// which some requests require.
+static future<sstring> read_checksummed_body(request& req, bool required) {
     check_plain_body(req);
     auto sums = upload_checksums_from_headers(req);
     if (sums.expected.empty()) {
-        throw invalid_request("Missing required header for this request: Content-MD5");
+        if (required) {
+            throw invalid_request("Missing required header for this request: Content-MD5");
+        }
+        co_return co_await util::read_entire_stream_contiguous(*req.content_stream);
     }
     auto in = make_verifying_stream(*req.content_stream, std::move(sums.expected));
     co_return co_await util::read_entire_stream_contiguous(in);
@@ -1339,7 +1342,8 @@ private:
     // does not exist is deleted too. A key that fails to be deleted gets an
     // error of its own, and the others are deleted still.
     future<std::unique_ptr<reply>> delete_objects(request& req, std::unique_ptr<reply> rep) {
-        auto objects = parse_objects_to_delete(co_await read_checksummed_body(req));
+        // S3 requires the Content-MD5 of a DeleteObjects request.
+        auto objects = parse_objects_to_delete(co_await read_checksummed_body(req, true));
         auto bucket = bucket_param(req);
         co_await check_bucket(bucket);
 
@@ -1743,7 +1747,8 @@ private:
     // Replaces the object's tags, in place: its ETag and Last-Modified stay.
     future<std::unique_ptr<reply>> put_object_tagging(request& req, std::unique_ptr<reply> rep) {
         reject_query_params(req, {"versionId"});
-        auto tags = parse_tagging(co_await read_checksummed_body(req));
+        // S3's SDKs always send a checksum, but S3 does not require one.
+        auto tags = parse_tagging(co_await read_checksummed_body(req, false));
         co_await _storage.update_object(bucket_param(req), key_param(req), attrs_update{.tags = std::move(tags)}, {});
         co_return empty_reply(std::move(rep), status::ok);
     }

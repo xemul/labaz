@@ -145,9 +145,10 @@ place with PutObjectTagging and DeleteObjectTagging, which leave the
 object's `ETag` and `Last-Modified` as they are. A new version of an object
 has the tags it is made with. S3's rules apply: up to 10 tags
 (`BadRequest`), keys of 1 to 128 characters and values of up to 256
-(`InvalidTag`), no key twice (`InvalidTag`). PutObjectTagging requires a
-`Content-MD5` or `x-amz-checksum-*` of its body, as S3's API says
-(`InvalidRequest`). A `versionId` fails with `NotImplemented`.
+(`InvalidTag`), no key twice (`InvalidTag`). A `Content-MD5` or
+`x-amz-checksum-*` of a PutObjectTagging body is verified (`BadDigest`), but
+not required: S3's SDKs always send one, while S3 does not ask for it. A
+`versionId` fails with `NotImplemented`.
 
 Keys are up to 1024 bytes (`KeyTooLongError`). Keys ending with `/` are not
 supported and are refused with `InvalidArgument`.
