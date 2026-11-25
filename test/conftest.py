@@ -162,7 +162,7 @@ def plywood(http_url):
     return c
 
 
-@pytest.fixture(params=["plywood", "s3"])
+@pytest.fixture(params=["plywood", "s3", "gcs"])
 def client(request, run_labaz):
     """A client of a fresh server, through each facade in turn (see
     facades.py), with a bucket named 'bkt' created."""
@@ -206,4 +206,22 @@ def s3(request):
     from facades import s3_client
     c = s3_client(request.getfixturevalue("s3_url" if "s3_url" in request.fixturenames else "signed_s3_url"))
     c.create_bucket(Bucket="bkt")
+    return c
+
+
+@pytest.fixture
+def gcs_url(run_labaz) -> str:
+    """The URL of a fresh server's gcs facade."""
+    port = free_port()
+    run_labaz(["--facade", f"gcs:http={port}"])
+    return f"http://127.0.0.1:{port}"
+
+
+@pytest.fixture
+def gcs(gcs_url):
+    """A google-cloud-storage client of a fresh server's gcs facade, with a
+    bucket named 'bkt' created."""
+    from facades import gcs_client
+    c = gcs_client(gcs_url)
+    c.create_bucket("bkt")
     return c

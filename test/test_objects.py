@@ -25,6 +25,14 @@ def expect_error(client, errc: str, func, *args, **kwargs):
     assert (e.value.code, e.value.status) == client.error(errc)
 
 
+def requires(client, *features: str):
+    """Skips the test for a facade without all of the features (see
+    facades.py)."""
+    missing = set(features) - client.features
+    if missing:
+        pytest.skip(f"{client.name} has no {', '.join(sorted(missing))}")
+
+
 def expect_status(status: int, func, *args, **kwargs):
     """Expects func() to fail with `status`, e.g. a HEAD, which has no body
     to carry an error code."""
@@ -72,7 +80,8 @@ def test_put_get(client):
     client.put("bkt", "key", b"hello", metadata={"Color": "red"})
     o = client.get("bkt", "key")
     assert (o.data, o.size, o.status) == (b"hello", 5, 200)
-    assert o.metadata == {"color": "red"}
+    # Metadata goes in headers, whose names have no case, but in GCS's JSON.
+    assert o.metadata == ({"Color": "red"} if client.name == "gcs" else {"color": "red"})
 
 
 def test_head(client):
@@ -83,6 +92,7 @@ def test_head(client):
 
 
 def test_head_error_has_no_body(client):
+    requires(client, "head")
     # Raw HTTP: clients buffer what comes after the headers of a reply to
     # HEAD and drop it, which would hide a body sent there.
     with socket.create_connection(urllib.parse.urlparse(client.url).netloc.split(":")) as s:
@@ -162,6 +172,10 @@ def test_unsatisfiable_range(client, rng):
     "/".join(["y" * 300] * 3),
 ])
 def test_key_round_trip(client, key):
+    if client.name == "gcs" and key in (".", ".."):
+        # GCS's naming rules forbid them.
+        expect_error(client, "invalid_argument", client.put, "bkt", key, b"x")
+        return
     client.put("bkt", key, key.encode())
     assert client.read("bkt", key) == key.encode()
     assert client.list_keys("bkt") == [key]
@@ -228,6 +242,7 @@ BIG = b"a" * PART_SIZE
 
 
 def test_upload(client):
+    requires(client, "parts")
     u = client.open_upload("bkt", "obj", metadata={"m": "v"})
     client.upload_part("bkt", "obj", u, 3, b"ccc")
     client.upload_part("bkt", "obj", u, 1, BIG)
@@ -239,6 +254,7 @@ def test_upload(client):
 
 
 def test_upload_resent_part_replaces(client):
+    requires(client, "parts")
     u = client.open_upload("bkt", "obj")
     client.upload_part("bkt", "obj", u, 1, b"old")
     client.upload_part("bkt", "obj", u, 1, b"new!")
@@ -248,6 +264,7 @@ def test_upload_resent_part_replaces(client):
 
 
 def test_upload_complete_subset(client):
+    requires(client, "parts")
     u = client.open_upload("bkt", "obj")
     client.upload_part("bkt", "obj", u, 1, BIG)
     for n in range(2, 5):
@@ -257,6 +274,7 @@ def test_upload_complete_subset(client):
 
 
 def test_upload_complete_missing_part(client):
+    requires(client, "parts")
     u = client.open_upload("bkt", "obj")
     client.upload_part("bkt", "obj", u, 1, BIG)
     expect_error(client, "no_such_part", client.complete, "bkt", "obj", u, [1, 2])
@@ -265,6 +283,7 @@ def test_upload_complete_missing_part(client):
 
 
 def test_upload_complete_retry(client):
+    requires(client, "parts")
     u = client.open_upload("bkt", "obj")
     client.upload_part("bkt", "obj", u, 1, b"1")
     first = client.complete("bkt", "obj", u, [1])
@@ -275,11 +294,11 @@ def test_upload_complete_retry(client):
 
 def test_upload_must_not_exist(client):
     client.put("bkt", "obj", b"x")
-    u = client.open_upload("bkt", "obj")
+    u = client.open_upload("bkt", "obj", must_not_exist=True)
     client.upload_part("bkt", "obj", u, 1, b"y")
     expect_error(client, "precondition_failed", client.complete, "bkt", "obj", u, [1], must_not_exist=True)
     assert client.read("bkt", "obj") == b"x"
-    u = client.open_upload("bkt", "new")
+    u = client.open_upload("bkt", "new", must_not_exist=True)
     client.upload_part("bkt", "new", u, 1, b"y")
     client.complete("bkt", "new", u, [1], must_not_exist=True)
     assert client.read("bkt", "new") == b"y"
@@ -319,6 +338,8 @@ def test_upload_of_another_object(client):
 
 @pytest.mark.parametrize("upload", ["nope", "0.zz", "99.1", "0.1", "../x", ""])
 def test_bad_upload_ids(client, upload):
+    if client.name == "gcs" and not upload:
+        pytest.skip("a GCS upload URI without an id is a bad request")
     expect_error(client, "no_such_session", client.list_parts, "bkt", "obj", upload)
 
 
@@ -345,6 +366,7 @@ def test_range_across_parts(client):
 # Copies
 
 def test_copy_object(client):
+    requires(client, "copy")
     client.put("bkt", "src", b"payload", metadata={"m": "src"})
     client.copy("bkt", "dst", "src", metadata={"m": "dst"})
     o = client.get("bkt", "dst")
@@ -354,6 +376,7 @@ def test_copy_object(client):
 
 
 def test_copy_shares_files(client, tmp_path):
+    requires(client, "copy")
     client.put("bkt", "src", b"payload")
     client.copy("bkt", "dst", "src")
     links = [f.stat().st_nlink for f in (tmp_path / "server0" / "data").rglob("part.*")]
@@ -361,6 +384,7 @@ def test_copy_shares_files(client, tmp_path):
 
 
 def test_copy_outlives_source(client):
+    requires(client, "copy")
     u = client.open_upload("bkt", "src")
     client.upload_part("bkt", "src", u, 1, BIG)
     client.upload_part("bkt", "src", u, 2, b"tail")
@@ -373,6 +397,7 @@ def test_copy_outlives_source(client):
 
 
 def test_copy_onto_itself(client):
+    requires(client, "copy")
     client.put("bkt", "obj", b"payload", metadata={"m": "old"})
     client.copy("bkt", "obj", "obj", metadata={"m": "new"})
     o = client.get("bkt", "obj")
@@ -380,6 +405,7 @@ def test_copy_onto_itself(client):
 
 
 def test_copy_empty_object(client):
+    requires(client, "copy")
     client.put("bkt", "src", b"")
     client.copy("bkt", "dst", "src")
     o = client.get("bkt", "dst")
@@ -387,6 +413,7 @@ def test_copy_empty_object(client):
 
 
 def test_copy_must_not_exist(client):
+    requires(client, "copy")
     client.put("bkt", "src", b"payload")
     client.copy("bkt", "dst", "src", must_not_exist=True)
     client.put("bkt", "src", b"other")
@@ -395,6 +422,7 @@ def test_copy_must_not_exist(client):
 
 
 def test_copy_missing_source(client):
+    requires(client, "copy")
     expect_error(client, "no_such_key", client.copy, "bkt", "dst", "nope")
     expect_error(client, "no_such_key", client.read, "bkt", "dst")
     u = client.open_upload("bkt", "dst")
@@ -404,6 +432,7 @@ def test_copy_missing_source(client):
 
 
 def test_copy_parts(client):
+    requires(client, "copy", "parts")
     data = os.urandom(PART_SIZE) + b"tail"
     client.put("bkt", "src", data)
     u = client.open_upload("bkt", "dst")
@@ -418,6 +447,7 @@ def test_copy_parts(client):
 
 
 def test_copy_part_dropped_on_abort(client, tmp_path):
+    requires(client, "copy")
     client.put("bkt", "src", b"payload")
     u = client.open_upload("bkt", "dst")
     client.copy_part("bkt", "dst", u, 1, "src")
@@ -427,6 +457,7 @@ def test_copy_part_dropped_on_abort(client, tmp_path):
 
 
 def test_copy_odd_keys(client):
+    requires(client, "copy")
     src = "a&b=c/%2F?#+ ü"
     client.put("bkt", src, b"x")
     client.copy("bkt", "dst", src)
@@ -440,7 +471,7 @@ def test_verify_object(client):
     client.put("bkt", "obj", data, verify={"crc32c": digest("crc32c", data)})
     client.put("bkt", "obj", data, verify={"md5": digest("md5", data)})
     expect_error(client, "bad_digest", client.put, "bkt", "obj", b"other", verify={"md5": digest("md5", data)})
-    expect_error(client, "bad_digest", client.put, "bkt", "obj", b"other", verify={"sha256": digest("sha256", data)})
+    expect_error(client, "bad_digest", client.put, "bkt", "obj", b"other", verify={"crc32c": digest("crc32c", data)})
     assert client.read("bkt", "obj") == data
 
 

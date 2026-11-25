@@ -354,4 +354,61 @@ input_stream<char> make_verifying_stream(input_stream<char>& in, checksums expec
     });
 }
 
+static constexpr std::string_view base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+sstring to_base64(std::string_view bytes) {
+    std::string ret;
+    size_t i = 0;
+    for (; i + 2 < bytes.size(); i += 3) {
+        uint32_t v = uint8_t(bytes[i]) << 16 | uint8_t(bytes[i + 1]) << 8 | uint8_t(bytes[i + 2]);
+        ret += base64_chars[v >> 18];
+        ret += base64_chars[(v >> 12) & 63];
+        ret += base64_chars[(v >> 6) & 63];
+        ret += base64_chars[v & 63];
+    }
+    if (i + 1 == bytes.size()) {
+        uint32_t v = uint8_t(bytes[i]) << 16;
+        ret += base64_chars[v >> 18];
+        ret += base64_chars[(v >> 12) & 63];
+        ret += "==";
+    } else if (i + 2 == bytes.size()) {
+        uint32_t v = uint8_t(bytes[i]) << 16 | uint8_t(bytes[i + 1]) << 8;
+        ret += base64_chars[v >> 18];
+        ret += base64_chars[(v >> 12) & 63];
+        ret += base64_chars[(v >> 6) & 63];
+        ret += '=';
+    }
+    return sstring(ret);
+}
+
+// Padded base64 only.
+std::optional<sstring> from_base64(std::string_view s) {
+    if (s.size() % 4) {
+        return std::nullopt;
+    }
+    std::string ret;
+    uint32_t v = 0;
+    int bits = 0;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '=') {
+            // Padding: at most two, and only at the end.
+            if (i + 2 < s.size() || (i + 1 < s.size() && s[i + 1] != '=')) {
+                return std::nullopt;
+            }
+            break;
+        }
+        auto p = base64_chars.find(s[i]);
+        if (p == std::string_view::npos) {
+            return std::nullopt;
+        }
+        v = v << 6 | p;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            ret += char((v >> bits) & 0xff);
+        }
+    }
+    return sstring(ret);
+}
+
 } // namespace labaz

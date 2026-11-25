@@ -6,19 +6,35 @@ do the same way. Each facade's client raises FacadeError, whose code and
 status are the facade's own; error() gives them for a storage error code.
 
 Multipart uploads are plywood's sessions. As S3 requires, every part of
-an upload but the last must have at least PART_SIZE bytes."""
+an upload but the last must have at least PART_SIZE bytes. Not every
+facade has everything: `features` lists what of the following a client
+has, and tests that need any of them skip the others:
+
+- "parts": parts that may come in any order, be sent again or left out,
+  and be listed; GCS's resumable uploads append chunks in order.
+- "copy": copies of objects.
+- "head": HEAD requests (GCS's JSON API has none)."""
 
 import base64
+import json
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import boto3
 import botocore
+import google.api_core.exceptions
+import google.resumable_media
+import requests
 from botocore.config import Config
+from google.auth.credentials import AnonymousCredentials
+from google.cloud import storage as gcs_storage
+from google.resumable_media.requests import Download
 
 from facade_error import FacadeError
 from plywood_client import PlywoodClient
 
-FACADES = ["plywood", "s3"]
+FACADES = ["plywood", "s3", "gcs"]
+ALL_FEATURES = {"parts", "copy", "head"}
 PART_SIZE = 5 << 20
 
 
@@ -62,6 +78,7 @@ PLYWOOD_ERRORS = {
 
 class PlywoodFacade:
     name = "plywood"
+    features = ALL_FEATURES
 
     def __init__(self, url: str):
         self.url = url
@@ -116,7 +133,8 @@ class PlywoodFacade:
 
     # multipart uploads
 
-    def open_upload(self, bucket, key, metadata: dict | None = None) -> str:
+    def open_upload(self, bucket, key, metadata: dict | None = None, must_not_exist: bool = False) -> str:
+        """must_not_exist goes with complete() as well."""
         return self.c.open_session(bucket, key, metadata=metadata)
 
     def upload_part(self, bucket, key, upload: str, number: int, data: bytes):
@@ -155,6 +173,7 @@ S3_ERRORS = {
 
 class S3Facade:
     name = "s3"
+    features = ALL_FEATURES
 
     def __init__(self, url: str):
         self.url = url
@@ -232,7 +251,7 @@ class S3Facade:
 
     # multipart uploads
 
-    def open_upload(self, bucket, key, metadata: dict | None = None) -> str:
+    def open_upload(self, bucket, key, metadata: dict | None = None, must_not_exist: bool = False) -> str:
         return self._call("create_multipart_upload", Bucket=bucket, Key=key, Metadata=metadata or {})["UploadId"]
 
     def upload_part(self, bucket, key, upload: str, number: int, data: bytes):
@@ -260,5 +279,182 @@ class S3Facade:
         self._call("abort_multipart_upload", Bucket=bucket, Key=key, UploadId=upload)
 
 
+def gcs_client(url: str) -> gcs_storage.Client:
+    """A google-cloud-storage client of the gcs facade at `url`."""
+    return gcs_storage.Client(project="labaz", credentials=AnonymousCredentials(),
+                              client_options={"api_endpoint": url})
+
+
+# Storage error codes as (reason, status) of the gcs facade.
+GCS_ERRORS = {
+    "no_such_bucket": ("notFound", 404),
+    "no_such_key": ("notFound", 404),
+    "no_such_session": ("notFound", 404),
+    "bucket_exists": ("conflict", 409),
+    "bucket_not_empty": ("conflict", 409),
+    "invalid_argument": ("invalid", 400),
+    "invalid_range": ("requestedRangeNotSatisfiable", 416),
+    "precondition_failed": ("conditionNotMet", 412),
+    "bad_digest": ("invalid", 400),
+}
+
+
+def gcs_error(r: requests.Response) -> FacadeError:
+    try:
+        err = r.json()["error"]
+        return FacadeError(r.status_code, err["errors"][0]["reason"], err["message"])
+    except (ValueError, KeyError, IndexError):
+        return FacadeError(r.status_code, "", r.text)
+
+
+class GcsFacade:
+    """Through google-cloud-storage. An upload is a resumable upload, whose
+    chunks are sent as such (the library has no call for one chunk), and
+    whose parts must come in order."""
+    name = "gcs"
+    features = set()
+
+    def __init__(self, url: str):
+        self.url = url
+        self.c = gcs_client(url)
+        # The uploads opened with must_not_exist.
+        self.must_not_exist = set()
+        # The sizes of the chunks sent, and the last part, not sent yet, by
+        # (bucket, key, upload).
+        self.parts = {}
+
+    def error(self, errc: str) -> tuple[str, int]:
+        return GCS_ERRORS[errc]
+
+    def _call(self, func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except google.api_core.exceptions.GoogleAPICallError as e:
+            # Errors of uploads come without their details.
+            if not e.errors and e.response is not None:
+                raise gcs_error(e.response)
+            reason = e.errors[0].get("reason", "") if e.errors else ""
+            raise FacadeError(e.code, reason, e.message)
+        except google.resumable_media.InvalidResponse as e:
+            raise gcs_error(e.response)
+
+    def _blob(self, bucket, key):
+        return self.c.bucket(bucket).blob(key)
+
+    def create_bucket(self, bucket):
+        self._call(self.c.create_bucket, bucket)
+
+    def delete_bucket(self, bucket):
+        self._call(self.c.bucket(bucket).delete)
+
+    def list_buckets(self) -> list[str]:
+        return self._call(lambda: [b.name for b in self.c.list_buckets()])
+
+    def put(self, bucket, key, data: bytes, metadata: dict | None = None, verify: dict | None = None):
+        """verify: {algorithm: hex digest} the body must have, md5 or crc32c."""
+        blob = self._blob(bucket, key)
+        blob.metadata = metadata
+        for alg, value in (verify or {}).items():
+            setattr(blob, {"md5": "md5_hash", "crc32c": "crc32c"}[alg], base64.b64encode(bytes.fromhex(value)).decode())
+        # The library would compute a checksum of its own, over the one given.
+        self._call(blob.upload_from_string, data, checksum=None if verify else "auto")
+
+    def _download(self, bucket, key, range: str | None) -> requests.Response:
+        url = f"{self.url}/download/storage/v1/b/{bucket}/o/{quote(key, safe='')}?alt=media"
+        d = Download(url, headers={"Range": range} if range else {}, checksum=None)
+        return self._call(d.consume, self.c._http)
+
+    def get(self, bucket, key, range: str | None = None) -> Object:
+        r = self._download(bucket, key, range)
+        o = self.head(bucket, key)
+        return Object(data=r.content, size=o.size, metadata=o.metadata, status=r.status_code,
+                      content_range=r.headers.get("Content-Range"))
+
+    def read(self, bucket, key, range: str | None = None) -> bytes:
+        return self._download(bucket, key, range).content
+
+    def head(self, bucket, key) -> Object:
+        blob = self._blob(bucket, key)
+        self._call(blob.reload)
+        return Object(size=blob.size, metadata=blob.metadata or {})
+
+    def delete(self, bucket, key):
+        self._call(self._blob(bucket, key).delete)
+
+    def list(self, bucket, prefix="", start_after="", max_keys=None) -> tuple[list[dict], bool]:
+        # startOffset is where to start from, the key included.
+        it = self.c.list_blobs(bucket, prefix=prefix or None, start_offset=start_after + "\0" if start_after else None,
+                               page_size=max_keys)
+        page = self._call(lambda: next(it.pages))
+        return [{"key": b.name, "size": b.size} for b in page], it.next_page_token is not None
+
+    def list_keys(self, bucket, prefix="", page=1000) -> list[str]:
+        return self._call(lambda: [b.name for b in self.c.list_blobs(bucket, prefix=prefix or None, page_size=page)])
+
+    # uploads
+
+    def _upload_url(self, bucket, key, upload: str) -> str:
+        url = (f"{self.url}/upload/storage/v1/b/{bucket}/o?uploadType=resumable"
+               f"&name={quote(key, safe='')}&upload_id={quote(upload, safe='')}")
+        if upload in self.must_not_exist:
+            url += "&ifGenerationMatch=0"
+        return url
+
+    def _send(self, method, bucket, key, upload: str, data: bytes = b"", content_range: str | None = None):
+        headers = {"Content-Range": content_range} if content_range else {}
+        r = requests.request(method, self._upload_url(bucket, key, upload), data=data, headers=headers,
+                             allow_redirects=False)
+        if r.status_code >= 400 and r.status_code != 499:
+            raise gcs_error(r)
+        return r
+
+    def open_upload(self, bucket, key, metadata: dict | None = None, must_not_exist: bool = False) -> str:
+        blob = self._blob(bucket, key)
+        blob.metadata = metadata
+        url = self._call(blob.create_resumable_upload_session, if_generation_match=0 if must_not_exist else None)
+        upload = dict(p.split("=", 1) for p in url.split("?", 1)[1].split("&"))["upload_id"]
+        if must_not_exist:
+            self.must_not_exist.add(upload)
+        return upload
+
+    def upload_part(self, bucket, key, upload: str, number: int, data: bytes):
+        """Sends the part before, now that it is not the last: only the last
+        chunk may be of any size."""
+        sent, pending = self.parts.setdefault((bucket, key, upload), ([], []))
+        assert number == len(sent) + len(pending) + 1, "the parts of a resumable upload come in order"
+        self._held(bucket, key, upload)
+        if pending:
+            first = sum(sent)
+            self._send("PUT", bucket, key, upload, pending[0], f"bytes {first}-{first + len(pending[0]) - 1}/*")
+            sent.append(len(pending.pop()))
+        pending.append(data)
+
+    def _held(self, bucket, key, upload: str) -> int:
+        """What the server holds of the upload, which must be there."""
+        r = self._send("PUT", bucket, key, upload, content_range="bytes */*")
+        return int(r.headers["Range"].split("-")[1]) + 1 if "Range" in r.headers else 0
+
+    def list_parts(self, bucket, key, upload: str) -> list[tuple[int, int]]:
+        sent, pending = self.parts.get((bucket, key, upload), ([], []))
+        assert self._held(bucket, key, upload) == sum(sent)
+        return [(n, size) for n, size in enumerate(sent + [len(d) for d in pending], 1)]
+
+    def complete(self, bucket, key, upload: str, parts: list[int], must_not_exist: bool = False):
+        """Returns the object's generation: what a completion of a completed
+        upload replies with again. must_not_exist goes with open_upload()."""
+        sent, pending = self.parts.get((bucket, key, upload), ([], []))
+        assert parts == list(range(1, len(sent) + len(pending) + 1)), "a resumable upload completes with all its chunks"
+        first = sum(sent)
+        if pending and pending[0]:
+            total = first + len(pending[0])
+            r = self._send("PUT", bucket, key, upload, pending[0], f"bytes {first}-{total - 1}/{total}")
+        else:
+            r = self._send("PUT", bucket, key, upload, content_range=f"bytes */{first}")
+        return r.json()["generation"]
+
+    def abort(self, bucket, key, upload: str):
+        self._send("DELETE", bucket, key, upload)
+
+
 def make_client(facade: str, url: str):
-    return {"plywood": PlywoodFacade, "s3": S3Facade}[facade](url)
+    return {"plywood": PlywoodFacade, "s3": S3Facade, "gcs": GcsFacade}[facade](url)

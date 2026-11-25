@@ -27,6 +27,9 @@
 #include <seastar/util/log.hh>
 #include <seastar/util/short_streams.hh>
 
+#include "http_util.hh"
+#include "listing.hh"
+
 namespace labaz::s3 {
 
 using namespace seastar;
@@ -128,87 +131,6 @@ static s3_error to_s3_error(const storage_error& e) {
 // Encodings
 //
 
-static constexpr std::string_view base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static sstring to_base64(std::string_view bytes) {
-    std::string ret;
-    size_t i = 0;
-    for (; i + 2 < bytes.size(); i += 3) {
-        uint32_t v = uint8_t(bytes[i]) << 16 | uint8_t(bytes[i + 1]) << 8 | uint8_t(bytes[i + 2]);
-        ret += base64_chars[v >> 18];
-        ret += base64_chars[(v >> 12) & 63];
-        ret += base64_chars[(v >> 6) & 63];
-        ret += base64_chars[v & 63];
-    }
-    if (i + 1 == bytes.size()) {
-        uint32_t v = uint8_t(bytes[i]) << 16;
-        ret += base64_chars[v >> 18];
-        ret += base64_chars[(v >> 12) & 63];
-        ret += "==";
-    } else if (i + 2 == bytes.size()) {
-        uint32_t v = uint8_t(bytes[i]) << 16 | uint8_t(bytes[i + 1]) << 8;
-        ret += base64_chars[v >> 18];
-        ret += base64_chars[(v >> 12) & 63];
-        ret += base64_chars[(v >> 6) & 63];
-        ret += '=';
-    }
-    return sstring(ret);
-}
-
-// Padded base64 only.
-static std::optional<sstring> from_base64(std::string_view s) {
-    if (s.size() % 4) {
-        return std::nullopt;
-    }
-    std::string ret;
-    uint32_t v = 0;
-    int bits = 0;
-    for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] == '=') {
-            // Padding: at most two, and only at the end.
-            if (i + 2 < s.size() || (i + 1 < s.size() && s[i + 1] != '=')) {
-                return std::nullopt;
-            }
-            break;
-        }
-        auto p = base64_chars.find(s[i]);
-        if (p == std::string_view::npos) {
-            return std::nullopt;
-        }
-        v = v << 6 | p;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            ret += char((v >> bits) & 0xff);
-        }
-    }
-    return sstring(ret);
-}
-
-// Percent-encodes everything but the unreserved characters and, unless
-// told otherwise, '/', as S3 does for encoding-type=url and SigV4 does.
-static sstring url_encode(std::string_view s, bool keep_slash = true) {
-    std::string ret;
-    for (unsigned char c : s) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || (c == '/' && keep_slash)) {
-            ret += char(c);
-        } else {
-            ret += fmt::format("%{:02X}", c);
-        }
-    }
-    return sstring(ret);
-}
-
-// "Wed, 12 Oct 2009 17:50:00 GMT"
-static sstring http_date(clock_type::time_point t) {
-    auto tt = clock_type::to_time_t(t);
-    struct tm tm;
-    gmtime_r(&tt, &tm);
-    char buf[64];
-    auto n = strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    return sstring(buf, n);
-}
-
 // Parses an HTTP date in any of the formats HTTP allows: IMF-fixdate (as
 // http_date() writes it), RFC 850 and asctime.
 static std::optional<clock_type::time_point> parse_http_date(const sstring& s) {
@@ -220,17 +142,6 @@ static std::optional<clock_type::time_point> parse_http_date(const sstring& s) {
         }
     }
     return std::nullopt;
-}
-
-// "2009-10-12T17:50:30.000Z"
-static sstring iso8601_date(clock_type::time_point t) {
-    auto tt = clock_type::to_time_t(t);
-    struct tm tm;
-    gmtime_r(&tt, &tm);
-    char buf[64];
-    auto n = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count() % 1000;
-    return sstring(fmt::format("{}.{:03}Z", std::string_view(buf, n), ms));
 }
 
 //
@@ -575,33 +486,9 @@ static void check_plain_body(const request& req) {
     }
 }
 
-// Parses a "bytes=first-last" range. S3 ignores a Range header it cannot
-// parse, as HTTP allows, so this returns nullopt for such.
+// S3 ignores a Range header it cannot parse, as HTTP allows.
 static std::optional<byte_range> range_from_headers(const request& req) {
-    auto header = req.get_header("Range");
-    std::string_view s = header;
-    if (!s.starts_with("bytes=") || s.find(',') != std::string_view::npos) {
-        return std::nullopt;
-    }
-    s.remove_prefix(6);
-    auto dash = s.find('-');
-    if (dash == std::string_view::npos || (dash == 0 && dash + 1 == s.size())) {
-        return std::nullopt;
-    }
-    byte_range r;
-    if (dash > 0) {
-        r.first = parse_number<uint64_t>(s.substr(0, dash));
-        if (!r.first) {
-            return std::nullopt;
-        }
-    }
-    if (dash + 1 < s.size()) {
-        r.last = parse_number<uint64_t>(s.substr(dash + 1));
-        if (!r.last) {
-            return std::nullopt;
-        }
-    }
-    return r;
+    return parse_range_header(req.get_header("Range"));
 }
 
 //
@@ -924,26 +811,6 @@ static future<> send_data(input_stream<char> in, output_stream<char>& out) {
 //
 // Listing
 //
-
-// What a ListObjects(V2) request asks for.
-struct list_request {
-    sstring bucket;
-    sstring prefix;
-    sstring delimiter;
-    // List what follows this key.
-    sstring after;
-    unsigned max_keys = max_list_keys;
-    bool url_encoded = false;
-};
-
-// Keys and common prefixes in byte order, up to max_keys of them together.
-struct list_result {
-    std::vector<object_info> objects;
-    std::vector<sstring> prefixes;
-    bool truncated = false;
-    // The last key or prefix listed.
-    sstring last;
-};
 
 //
 // Authentication
@@ -1446,6 +1313,8 @@ private:
         }
 
         list_request lr;
+        lr.max_entries = max_list_keys;
+        bool url_encoded = false;
         lr.bucket = bucket_param(req);
         lr.prefix = req.get_query_param("prefix");
         lr.delimiter = req.get_query_param("delimiter");
@@ -1453,14 +1322,14 @@ private:
             if (req.get_query_param("encoding-type") != "url") {
                 throw invalid_argument("Invalid Encoding Method specified in Request");
             }
-            lr.url_encoded = true;
+            url_encoded = true;
         }
         if (req.has_query_param("max-keys")) {
             auto n = parse_number<unsigned>(req.get_query_param("max-keys"));
             if (!n) {
                 throw invalid_argument("Provided max-keys not an integer or within integer range");
             }
-            lr.max_keys = std::min(*n, max_list_keys);
+            lr.max_entries = std::min(*n, max_list_keys);
         }
         sstring token;
         if (v2 && req.has_query_param("continuation-token")) {
@@ -1476,9 +1345,9 @@ private:
             lr.after = req.get_query_param("marker");
         }
 
-        auto res = co_await list(lr);
+        auto res = co_await list_delimited(_storage, lr);
 
-        auto encoded = [&] (std::string_view s) { return lr.url_encoded ? url_encode(s) : sstring(s); };
+        auto encoded = [&] (std::string_view s) { return url_encoded ? url_encode(s) : sstring(s); };
         xml_writer w;
         w.root("ListBucketResult");
         w.element("Name", lr.bucket);
@@ -1486,8 +1355,8 @@ private:
         if (!lr.delimiter.empty()) {
             w.element("Delimiter", encoded(lr.delimiter));
         }
-        w.element("MaxKeys", lr.max_keys);
-        if (lr.url_encoded) {
+        w.element("MaxKeys", lr.max_entries);
+        if (url_encoded) {
             w.element("EncodingType", "url");
         }
         w.element("IsTruncated", res.truncated ? "true" : "false");
@@ -1533,43 +1402,6 @@ private:
     // after the prefix into common prefixes (up to and including it). A
     // common prefix counts once, and only if it sorts after lr.after, so
     // that listing after a prefix skips its keys.
-    future<list_result> list(const list_request& lr) {
-        list_result ret;
-        sstring cursor = lr.after;
-        unsigned count = 0;
-        while (true) {
-            auto l = co_await _storage.list_objects(lr.bucket, lr.prefix, cursor, max_list_keys);
-            for (auto& o : l.objects) {
-                cursor = o.key;
-                std::optional<sstring> common;
-                if (!lr.delimiter.empty()) {
-                    auto pos = o.key.find(lr.delimiter, lr.prefix.size());
-                    if (pos != sstring::npos) {
-                        common = o.key.substr(0, pos + lr.delimiter.size());
-                    }
-                }
-                if (common && (!(lr.after < *common) || (!ret.prefixes.empty() && ret.prefixes.back() == *common))) {
-                    continue;
-                }
-                if (count == lr.max_keys) {
-                    ret.truncated = true;
-                    co_return ret;
-                }
-                count++;
-                if (common) {
-                    ret.last = *common;
-                    ret.prefixes.push_back(std::move(*common));
-                } else {
-                    ret.last = o.key;
-                    ret.objects.push_back(std::move(o));
-                }
-            }
-            if (!l.truncated) {
-                co_return ret;
-            }
-        }
-    }
-
     // Objects
 
     // Objects, or their multipart uploads with ?uploadId= (and ?uploads)

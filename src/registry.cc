@@ -7,6 +7,7 @@
 // their per-shard instances.
 
 #include "facade.hh"
+#include "gcs/gcs_facade.hh"
 #include "plywood/plywood_facade.hh"
 #include "potato/potato_storage.hh"
 #include "s3/s3_facade.hh"
@@ -34,6 +35,7 @@ const std::vector<facade_type>& facade_types() {
     static const std::vector<facade_type> types = {
         plywood::make_facade_type(),
         s3::make_facade_type(),
+        gcs::make_facade_type(),
     };
     return types;
 }

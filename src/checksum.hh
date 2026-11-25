@@ -61,6 +61,9 @@ seastar::sstring crc_combine(checksum_algorithm, std::string_view crc_a, std::st
 
 seastar::sstring to_hex(std::string_view bytes);
 std::optional<seastar::sstring> from_hex(std::string_view hex);
+seastar::sstring to_base64(std::string_view bytes);
+/// Padded base64 only.
+std::optional<seastar::sstring> from_base64(std::string_view b64);
 
 class checksum_mismatch : public std::runtime_error {
 public:

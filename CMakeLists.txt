@@ -45,8 +45,11 @@ add_executable (labaz
   src/registry.cc
   src/sharder.cc
   src/http_frontend.cc
+  src/http_util.cc
+  src/listing.cc
   src/plywood/plywood_facade.cc
   src/s3/s3_facade.cc
+  src/gcs/gcs_facade.cc
   src/potato/potato_storage.cc)
 
 target_include_directories (labaz
