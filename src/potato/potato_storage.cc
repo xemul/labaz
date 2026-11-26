@@ -67,15 +67,33 @@ static double ms_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
-// A hold of a shard's lock. With tracing on, it names what it is for and
+struct object_lock;
+
+// Objects' locks, by "<bucket>/<key>".
+using object_locks = std::unordered_map<sstring, object_lock*>;
+
+// An object's lock. It is kept while held or waited for, and leaves the
+// map when the last user drops it.
+struct object_lock : enable_lw_shared_from_this<object_lock> {
+    rwlock lock;
+    object_locks& locks;
+    sstring name;
+
+    object_lock(object_locks& locks, sstring name) : locks(locks), name(std::move(name)) {}
+    ~object_lock() { locks.erase(name); }
+};
+
+// A hold of an object's lock. With tracing on, it names what it is for and
 // traces how long it was held.
 class lock_hold {
+    lw_shared_ptr<object_lock> _lock;
     rwlock::holder _units;
     sstring _what;
     std::chrono::steady_clock::time_point _taken = std::chrono::steady_clock::now();
 
 public:
-    lock_hold(rwlock::holder units, sstring what) : _units(std::move(units)), _what(std::move(what)) {}
+    lock_hold(lw_shared_ptr<object_lock> lock, rwlock::holder units, sstring what)
+        : _lock(std::move(lock)), _units(std::move(units)), _what(std::move(what)) {}
     lock_hold(lock_hold&&) noexcept = default;
     ~lock_hold() { release(); }
 
@@ -84,6 +102,7 @@ public:
             return;
         }
         _units.return_all();
+        _lock = {};
         if (!_what.empty()) {
             plog.trace("{}: lock held for {:.3f}ms", _what, ms_since(_taken));
         }
@@ -400,13 +419,13 @@ class potato_storage final : public storage {
     fs::path _root;
     std::unordered_map<session_id, session_state> _sessions;
     uint64_t _last_unique = 0;
-    // Taken for write to publish, delete or abort, which remove directories;
-    // and for read to open or link an object's parts, so that they are not
-    // removed under the reader or the copy, and to create a session
-    // directory or add files to it, so that it is not removed meanwhile.
-    // Objects of a shard are served by that shard only, so a shard-wide lock
-    // covers all of them.
-    rwlock _lock;
+    // An object's lock is taken for write to publish, delete or abort, which
+    // remove its directories; and for read to open or link its parts, so that
+    // they are not removed under the reader or the copy, and to create a
+    // session directory or add files to it, so that it is not removed
+    // meanwhile. Objects of a shard are served by that shard only, so its
+    // locks cover them.
+    object_locks _locks;
 
     future<lock_hold> hold_lock(bool write, std::string_view op, const sstring& bucket, const sstring& key) {
         sstring what;
@@ -414,11 +433,19 @@ class potato_storage final : public storage {
             what = fmt::format("{} {}/{} ({})", op, bucket, key, write ? "write" : "read");
         }
         auto start = std::chrono::steady_clock::now();
-        auto units = co_await (write ? _lock.hold_write_lock() : _lock.hold_read_lock());
+        auto name = sstring(fmt::format("{}/{}", bucket, key));
+        lw_shared_ptr<object_lock> lock;
+        if (auto it = _locks.find(name); it != _locks.end()) {
+            lock = it->second->shared_from_this();
+        } else {
+            lock = make_lw_shared<object_lock>(_locks, name);
+            _locks.emplace(std::move(name), lock.get());
+        }
+        auto units = co_await (write ? lock->lock.hold_write_lock() : lock->lock.hold_read_lock());
         if (!what.empty()) {
             plog.trace("{}: lock waited for {:.3f}ms", what, ms_since(start));
         }
-        co_return lock_hold(std::move(units), std::move(what));
+        co_return lock_hold(std::move(lock), std::move(units), std::move(what));
     }
 
     future<lock_hold> read_lock(std::string_view op, const sstring& bucket, const sstring& key) {
@@ -543,31 +570,25 @@ public:
                                 sstring src_key, std::optional<byte_range> range, precondition src_pre) override {
         auto algorithms = active_session(bucket, key, id).attrs.checksums;
         auto dir = session_dir(bucket, key, id);
-        // A source of another shard is linked into the staging directory by
-        // that shard, under its own lock, and linked from there under this
-        // shard's, so no shard waits for a lock while holding its own.
-        std::optional<copy_source> staged;
-        if (auto owner = owner_of(bucket, src_key); owner != this_shard_id()) {
-            staged = co_await invoke_on(owner, [bucket, src_key, range, src_pre, algorithms] (storage& s) {
-                return static_cast<potato_storage&>(s).stage_source(bucket, src_key, range, src_pre, algorithms);
-            });
-        }
+        // The source is linked into the staging directory by its shard, under
+        // its lock, and linked from there under the session's, so no one waits
+        // for a lock while holding another.
+        auto staged = co_await invoke_on(owner_of(bucket, src_key), [bucket, src_key, range, src_pre, algorithms] (storage& s) {
+            return static_cast<potato_storage&>(s).stage_source(bucket, src_key, range, src_pre, algorithms);
+        });
         sealed_part part{{}, 0, {}};
         std::exception_ptr ex;
         try {
-            // Keeps the source's files and the session directory in place;
-            // the links then live on their own.
+            // Keeps the session directory in place; the links then live on
+            // their own.
             auto lock = co_await read_lock("copy part", bucket, key);
             active_session(bucket, key, id);
-            auto src = staged ? *staged : co_await find_source(bucket, src_key, range, src_pre, algorithms);
-            part = co_await link_slices(src, dir, fmt::format("{}{}.", part_prefix, number));
+            part = co_await link_slices(staged, dir, fmt::format("{}{}.", part_prefix, number));
         } catch (...) {
             ex = std::current_exception();
         }
-        if (staged) {
-            auto removed = co_await coroutine::as_future(remove_files(staged->dir, staged->slices));
-            removed.ignore_ready_future();
-        }
+        auto removed = co_await coroutine::as_future(remove_files(staged.dir, staged.slices));
+        removed.ignore_ready_future();
         if (ex) {
             std::rethrow_exception(ex);
         }
@@ -773,8 +794,8 @@ private:
         co_return part;
     }
 
-    // Run on the source's shard for a copy to another shard: links the
-    // source's files into the staging directory, where they stay after the
+    // Run on the source's shard for a copy: links the source's files into
+    // the staging directory, where they stay after the
     // lock is released.
     future<copy_source> stage_source(sstring bucket, sstring src_key, std::optional<byte_range> range,
                                      precondition src_pre, std::set<checksum_algorithm> algorithms) {
