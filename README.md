@@ -61,7 +61,9 @@ volume. Environment variables configure it: `LABAZ_S3_PORT` and
 `labaz` as they are. See [container/entrypoint.sh](container/entrypoint.sh).
 For now the image is built in ScyllaDB's toolchain image
 (`docker.io/scylladb/scylla-toolchain`), which has Seastar's build
-dependencies; `--build-arg BUILDER=<image>` picks another.
+dependencies; `--build-arg BUILDER=<image>` picks another. Pushing a `v*`
+tag builds the image on GitHub and publishes it as
+`ghcr.io/<owner>/labaz:<tag>` (`.github/workflows/container.yml`).
 
 ## Testing
 
