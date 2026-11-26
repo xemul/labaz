@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Builds the container image (container/Containerfile) and pushes it to
-# ghcr.io/<owner>/labaz, tagged as the git tag, or as the branch when run by
-# hand.
+# ghcr.io/<owner>/labaz, tagged as the git tag, or as "latest" for master.
 
 name: container
 
 on:
   push:
+    branches: [master]
     tags: ['v*']
   workflow_dispatch:
 
@@ -35,5 +35,5 @@ jobs:
           context: .
           file: container/Containerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/labaz:${{ github.ref_name }}
+          tags: ghcr.io/${{ github.repository_owner }}/labaz:${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
