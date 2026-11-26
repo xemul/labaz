@@ -30,6 +30,7 @@
 #include "potato/potato_storage.hh"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <set>
 #include <system_error>
@@ -61,6 +62,33 @@ namespace fs = std::filesystem;
 namespace bpo = boost::program_options;
 
 static logger plog("potato");
+
+static double ms_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+// A hold of a shard's lock. With tracing on, it names what it is for and
+// traces how long it was held.
+class lock_hold {
+    rwlock::holder _units;
+    sstring _what;
+    std::chrono::steady_clock::time_point _taken = std::chrono::steady_clock::now();
+
+public:
+    lock_hold(rwlock::holder units, sstring what) : _units(std::move(units)), _what(std::move(what)) {}
+    lock_hold(lock_hold&&) noexcept = default;
+    ~lock_hold() { release(); }
+
+    void release() noexcept {
+        if (_units.count() == 0) {
+            return;
+        }
+        _units.return_all();
+        if (!_what.empty()) {
+            plog.trace("{}: lock held for {:.3f}ms", _what, ms_since(_taken));
+        }
+    }
+};
 
 static constexpr std::string_view meta_name = "meta.json";
 static constexpr std::string_view data_prefix = "data.";
@@ -380,6 +408,27 @@ class potato_storage final : public storage {
     // covers all of them.
     rwlock _lock;
 
+    future<lock_hold> hold_lock(bool write, std::string_view op, const sstring& bucket, const sstring& key) {
+        sstring what;
+        if (plog.is_enabled(log_level::trace)) {
+            what = fmt::format("{} {}/{} ({})", op, bucket, key, write ? "write" : "read");
+        }
+        auto start = std::chrono::steady_clock::now();
+        auto units = co_await (write ? _lock.hold_write_lock() : _lock.hold_read_lock());
+        if (!what.empty()) {
+            plog.trace("{}: lock waited for {:.3f}ms", what, ms_since(start));
+        }
+        co_return lock_hold(std::move(units), std::move(what));
+    }
+
+    future<lock_hold> read_lock(std::string_view op, const sstring& bucket, const sstring& key) {
+        return hold_lock(false, op, bucket, key);
+    }
+
+    future<lock_hold> write_lock(std::string_view op, const sstring& bucket, const sstring& key) {
+        return hold_lock(true, op, bucket, key);
+    }
+
 public:
     explicit potato_storage(fs::path root)
         : _root(std::move(root))
@@ -446,7 +495,7 @@ public:
         co_await check_bucket(bucket);
         // The shard keeps ids unique among the shards' sessions.
         auto id = session_id(fmt::format("{}.{:x}", this_shard_id(), next_unique()));
-        auto lock = co_await _lock.hold_read_lock();
+        auto lock = co_await read_lock("open session", bucket, key);
         co_await touch_directory(dir.native());
         co_await make_directory(session_dir(bucket, key, id).native());
         _sessions.emplace(id, session_state{std::move(bucket), std::move(key), std::move(attrs), {}, false, std::nullopt});
@@ -508,7 +557,7 @@ public:
         try {
             // Keeps the source's files and the session directory in place;
             // the links then live on their own.
-            auto lock = co_await _lock.hold_read_lock();
+            auto lock = co_await read_lock("copy part", bucket, key);
             active_session(bucket, key, id);
             auto src = staged ? *staged : co_await find_source(bucket, src_key, range, src_pre, algorithms);
             part = co_await link_slices(src, dir, fmt::format("{}{}.", part_prefix, number));
@@ -560,9 +609,9 @@ public:
         }
 
         st.committing = true;
-        auto lock = co_await _lock.hold_write_lock();
+        auto lock = co_await write_lock("commit session", bucket, key);
         auto f = co_await coroutine::as_future(publish(id, st, std::move(m), listed, pre));
-        lock.return_all();
+        lock.release();
         st.committing = false;
         if (f.failed()) {
             co_return coroutine::exception(f.get_exception());
@@ -576,7 +625,7 @@ public:
     future<> abort_session(sstring bucket, sstring key, session_id id) override {
         active_session(bucket, key, id);
         _sessions.erase(id);
-        auto lock = co_await _lock.hold_write_lock();
+        auto lock = co_await write_lock("abort session", bucket, key);
         co_await recursive_remove_directory(session_dir(bucket, key, id));
         co_await remove_if_empty(object_dir(bucket, key));
     }
@@ -588,7 +637,7 @@ public:
 
     future<object_reader> read_object(sstring bucket, sstring key, std::optional<byte_range> range) override {
         // Once the parts are open, removing them does not affect the reader.
-        auto lock = co_await _lock.hold_read_lock();
+        auto lock = co_await read_lock("read", bucket, key);
         auto m = co_await load_meta(bucket, key);
         auto [offset, length] = range ? resolve_range(*range, m.info.size) : resolved_range{0, m.info.size};
         auto src = co_await open_slices(object_dir(bucket, key) / m.data_dir.c_str(), cut(m.slices, offset, length));
@@ -596,7 +645,7 @@ public:
     }
 
     future<> delete_object(sstring bucket, sstring key) override {
-        auto lock = co_await _lock.hold_write_lock();
+        auto lock = co_await write_lock("delete", bucket, key);
         auto m = co_await load_meta(bucket, key);
         auto dir = object_dir(bucket, key);
         co_await remove_file((dir / meta_name).native());
@@ -605,7 +654,7 @@ public:
     }
 
     future<object_info> update_object(sstring bucket, sstring key, attrs_update update, precondition pre) override {
-        auto lock = co_await _lock.hold_write_lock();
+        auto lock = co_await write_lock("update", bucket, key);
         auto m = co_await load_meta(bucket, key);
         if (pre.generation_match && *pre.generation_match != m.info.generation) {
             fail(errc::precondition_failed, fmt::format("generation is {}, not {}", m.info.generation, *pre.generation_match));
@@ -729,7 +778,7 @@ private:
     // lock is released.
     future<copy_source> stage_source(sstring bucket, sstring src_key, std::optional<byte_range> range,
                                      precondition src_pre, std::set<checksum_algorithm> algorithms) {
-        auto lock = co_await _lock.hold_read_lock();
+        auto lock = co_await read_lock("stage copy source", bucket, src_key);
         auto src = co_await find_source(bucket, src_key, range, src_pre, algorithms);
         auto part = co_await link_slices(src, staging_dir(), fmt::format("{}.", this_shard_id()));
         co_return copy_source{staging_dir(), std::move(part.slices), std::move(part.sums)};

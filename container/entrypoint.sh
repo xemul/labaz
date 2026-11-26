@@ -11,6 +11,8 @@
 #   LABAZ_S3_REGION     the region they must be signed for
 #   LABAZ_SMP           the number of shards (1)
 #   LABAZ_MEMORY        the memory to use (1G)
+#   LABAZ_LOG_LEVEL     loggers' levels, as --logger-log-level takes them,
+#                       e.g. s3=trace:gcs=trace:potato=trace
 #
 # Arguments are passed on to labaz, after the ones above. It prints
 # "labaz: ready" once it serves.
@@ -33,5 +35,8 @@ if [ -n "$LABAZ_S3_KEY" ]; then
 fi
 if [ -n "$LABAZ_S3_REGION" ]; then
     set -- "$@" --s3-region "$LABAZ_S3_REGION"
+fi
+if [ -n "$LABAZ_LOG_LEVEL" ]; then
+    set -- "$@" --logger-log-level "$LABAZ_LOG_LEVEL"
 fi
 exec /usr/bin/labaz "$@"

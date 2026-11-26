@@ -12,6 +12,9 @@
 
 #include <fmt/format.h>
 
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/smp.hh>
+
 namespace labaz {
 
 using namespace seastar;
@@ -79,6 +82,36 @@ std::optional<byte_range> parse_range_header(std::string_view s) {
         }
     }
     return r;
+}
+
+request_id next_request_id() {
+    static thread_local uint64_t counter = 0;
+    return request_id{this_shard_id(), ++counter};
+}
+
+future<std::unique_ptr<http::reply>> run_traced(logger& log, request_id id,
+        std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep, handler_func run) {
+    auto start = std::chrono::steady_clock::now();
+    log.trace("{} {} {}", id, req->_method, req->_url);
+    auto ret = co_await run(req, std::move(rep));
+    log.trace("{} replied {} in {:.3f}ms", id, static_cast<int>(ret->_status), ms_since(start));
+    co_return ret;
+}
+
+future<> send_data(logger& log, input_stream<char> in, output_stream<char>& out, sstring bucket, sstring key) {
+    auto start = std::chrono::steady_clock::now();
+    std::exception_ptr ex;
+    try {
+        co_await copy(in, out);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await in.close();
+    if (ex) {
+        log.trace("{}/{}: sending data failed in {:.3f}ms: {}", bucket, key, ms_since(start), ex);
+        std::rethrow_exception(ex);
+    }
+    log.trace("{}/{}: data sent in {:.3f}ms", bucket, key, ms_since(start));
 }
 
 } // namespace labaz

@@ -886,19 +886,6 @@ static void check_read_headers(const request& req) {
                               "response-content-language", "response-content-type", "response-expires"});
 }
 
-static future<> send_data(input_stream<char> in, output_stream<char>& out) {
-    std::exception_ptr ex;
-    try {
-        co_await copy(in, out);
-    } catch (...) {
-        ex = std::current_exception();
-    }
-    co_await in.close();
-    if (ex) {
-        std::rethrow_exception(ex);
-    }
-}
-
 //
 // Listing
 //
@@ -1163,11 +1150,6 @@ private:
     func_type _func;
     const auth_config& _auth;
 
-    static sstring next_request_id() {
-        static thread_local uint64_t counter = 0;
-        return sstring(fmt::format("{:x}-{:x}", this_shard_id(), ++counter));
-    }
-
     static std::unique_ptr<reply> error_reply(const request& req, const s3_error& e, const sstring& id) {
         xml_writer w;
         w.open("Error")
@@ -1185,11 +1167,7 @@ private:
         return rep;
     }
 
-public:
-    s3_handler(func_type func, const auth_config& auth) : _func(std::move(func)), _auth(auth) {}
-
-    future<std::unique_ptr<reply>> handle(const sstring&, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
-        auto id = next_request_id();
+    future<std::unique_ptr<reply>> run(const sstring& id, std::unique_ptr<request>& req, std::unique_ptr<reply> rep) {
         // The body the signature covers, checked as it is read.
         std::optional<input_stream<char>> signed_body;
         std::exception_ptr ex;
@@ -1226,6 +1204,17 @@ public:
             co_return error_reply(*req, s3_error(status::internal_server_error, "InternalError",
                                                  "We encountered an internal error. Please try again."), id);
         }
+    }
+
+public:
+    s3_handler(func_type func, const auth_config& auth) : _func(std::move(func)), _auth(auth) {}
+
+    future<std::unique_ptr<reply>> handle(const sstring&, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        auto id = next_request_id();
+        return run_traced(s3log, id, std::move(req), std::move(rep),
+                [this, id = sstring(fmt::to_string(id))] (std::unique_ptr<request>& req, std::unique_ptr<reply> rep) {
+            return run(id, req, std::move(rep));
+        });
     }
 };
 
@@ -1565,8 +1554,8 @@ private:
         add_object_headers(*rep, req, r.info, !range);
         // The storage resolved the range already, so this does not throw.
         auto length = set_range(*rep, range, r.info.size);
-        rep->write_body(default_object_type, length, [data = std::move(r.data)] (output_stream<char>& out) mutable {
-            return send_data(std::move(data), out);
+        rep->write_body(default_object_type, length, [data = std::move(r.data), bucket = std::move(bucket), key = std::move(key)] (output_stream<char>& out) mutable {
+            return send_data(s3log, std::move(data), out, std::move(bucket), std::move(key));
         });
         co_return std::move(rep);
     }

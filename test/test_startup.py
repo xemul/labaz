@@ -111,3 +111,37 @@ def test_potato_without_data_dir(labaz_binary):
                        capture_output=True, text=True, timeout=30)
     assert r.returncode != 0
     assert "--data-dir" in r.stdout + r.stderr
+
+
+def object_round_trips(s3_port, gcs_port):
+    s3_url, gcs_url = f"http://127.0.0.1:{s3_port}", f"http://127.0.0.1:{gcs_port}"
+    assert requests.put(f"{s3_url}/bkt").status_code == 200
+    assert requests.put(f"{s3_url}/bkt/k", data=b"data").status_code == 200
+    assert requests.get(f"{s3_url}/bkt/k").content == b"data"
+    r = requests.post(f"{gcs_url}/upload/storage/v1/b/bkt/o", params={"uploadType": "media", "name": "g"}, data=b"data")
+    assert r.status_code == 200
+    assert requests.get(f"{gcs_url}/storage/v1/b/bkt/o/g", params={"alt": "media"}).content == b"data"
+
+
+def test_trace_logs(run_labaz):
+    s3_port, gcs_port = free_port(), free_port()
+    server = run_labaz(["--facade", f"s3:http={s3_port}", "--facade", f"gcs:http={gcs_port}",
+                        "--logger-log-level", "s3=trace:gcs=trace:potato=trace"])
+    object_round_trips(s3_port, gcs_port)
+    server.stop()
+    log = server.log()
+    assert "GET /bkt/k" in log
+    assert "replied 200 in" in log
+    assert "bkt/k: data sent in" in log
+    assert "GET /storage/v1/b/bkt/o/g" in log
+    assert "bkt/g: data sent in" in log
+    assert "commit session bkt/k (write): lock waited for" in log
+    assert "read bkt/g (read): lock held for" in log
+
+
+def test_no_trace_logs_by_default(run_labaz):
+    s3_port, gcs_port = free_port(), free_port()
+    server = run_labaz(["--facade", f"s3:http={s3_port}", "--facade", f"gcs:http={gcs_port}"])
+    object_round_trips(s3_port, gcs_port)
+    server.stop()
+    assert "TRACE" not in server.log()

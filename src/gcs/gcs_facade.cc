@@ -488,19 +488,6 @@ static void write_bucket(json_writer& w, const request& req, std::string_view bu
     w.EndObject();
 }
 
-static future<> send_data(input_stream<char> in, output_stream<char>& out) {
-    std::exception_ptr ex;
-    try {
-        co_await copy(in, out);
-    } catch (...) {
-        ex = std::current_exception();
-    }
-    co_await in.close();
-    if (ex) {
-        std::rethrow_exception(ex);
-    }
-}
-
 static bool is_storage_error(const std::exception_ptr& ep, errc code) {
     try {
         std::rethrow_exception(ep);
@@ -523,10 +510,7 @@ public:
 private:
     func_type _func;
 
-public:
-    explicit gcs_handler(func_type func) : _func(std::move(func)) {}
-
-    future<std::unique_ptr<reply>> handle(const sstring&, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+    future<std::unique_ptr<reply>> run(std::unique_ptr<request>& req, std::unique_ptr<reply> rep) {
         std::exception_ptr ex;
         try {
             co_return co_await _func(*req, std::move(rep));
@@ -546,6 +530,16 @@ public:
             gcslog.warn("{} {}: {}", req->_method, req->_url, e.what());
             co_return error_reply(gcs_error(500, "backendError", "We encountered an internal error. Please try again."));
         }
+    }
+
+public:
+    explicit gcs_handler(func_type func) : _func(std::move(func)) {}
+
+    future<std::unique_ptr<reply>> handle(const sstring&, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        return run_traced(gcslog, next_request_id(), std::move(req), std::move(rep),
+                [this] (std::unique_ptr<request>& req, std::unique_ptr<reply> rep) {
+            return run(req, std::move(rep));
+        });
     }
 };
 
@@ -768,7 +762,9 @@ private:
     // whole object only.
     future<std::unique_ptr<reply>> read_media(request& req, std::unique_ptr<reply> rep) {
         auto range = parse_range_header(req.get_header("Range"));
-        auto r = co_await _storage.read_object(bucket_param(req), object_param(req), range);
+        auto bucket = bucket_param(req);
+        auto name = object_param(req);
+        auto r = co_await _storage.read_object(bucket, name, range);
         std::exception_ptr ex;
         try {
             check_read_conditions(req, r.info);
@@ -805,8 +801,8 @@ private:
             }
             rep->set_status(status::ok);
         }
-        rep->write_body(sstring(object_content_type), length, [data = std::move(r.data)] (output_stream<char>& out) mutable {
-            return send_data(std::move(data), out);
+        rep->write_body(sstring(object_content_type), length, [data = std::move(r.data), bucket = std::move(bucket), name = std::move(name)] (output_stream<char>& out) mutable {
+            return send_data(gcslog, std::move(data), out, std::move(bucket), std::move(name));
         });
         co_return std::move(rep);
     }

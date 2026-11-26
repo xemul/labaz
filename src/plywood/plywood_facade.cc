@@ -20,7 +20,10 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/matchrules.hh>
+#include <seastar/util/log.hh>
 #include <seastar/util/short_streams.hh>
+
+#include "http_util.hh"
 
 namespace labaz::plywood {
 
@@ -29,6 +32,8 @@ using reply = http::reply;
 using request = http::request;
 using status = http::reply::status_type;
 namespace bpo = boost::program_options;
+
+static logger plylog("plywood");
 
 static constexpr std::string_view meta_header_prefix = "x-labaz-meta-";
 static constexpr std::string_view checksum_header_prefix = "x-labaz-checksum-";
@@ -319,19 +324,6 @@ static void add_object_headers(reply& rep, const object_info& info) {
     }
 }
 
-static future<> send_data(input_stream<char> in, output_stream<char>& out) {
-    std::exception_ptr ex;
-    try {
-        co_await copy(in, out);
-    } catch (...) {
-        ex = std::current_exception();
-    }
-    co_await in.close();
-    if (ex) {
-        std::rethrow_exception(ex);
-    }
-}
-
 //
 // Handlers
 //
@@ -495,7 +487,9 @@ private:
 
     future<std::unique_ptr<reply>> get_object(request& req, std::unique_ptr<reply> rep) {
         auto range = range_from_headers(req);
-        auto r = co_await _storage.read_object(bucket_param(req), key_param(req), range);
+        auto bucket = bucket_param(req);
+        auto key = key_param(req);
+        auto r = co_await _storage.read_object(bucket, key, range);
         add_object_headers(*rep, r.info);
         if (range) {
             auto rr = resolve_range(*range, r.info.size);
@@ -504,8 +498,8 @@ private:
         } else {
             rep->set_status(status::ok);
         }
-        rep->write_body("bin", [data = std::move(r.data)] (output_stream<char>& out) mutable {
-            return send_data(std::move(data), out);
+        rep->write_body("bin", [data = std::move(r.data), bucket = std::move(bucket), key = std::move(key)] (output_stream<char>& out) mutable {
+            return send_data(plylog, std::move(data), out, std::move(bucket), std::move(key));
         });
         co_return std::move(rep);
     }
