@@ -133,11 +133,6 @@ static std::unique_ptr<reply> json_reply(std::unique_ptr<reply> rep, Func func, 
     return rep;
 }
 
-static std::unique_ptr<reply> empty_reply(std::unique_ptr<reply> rep, status st) {
-    rep->set_status(st);
-    return rep;
-}
-
 static std::unique_ptr<reply> error_reply(const gcs_error& e) {
     if (e.get_status() == static_cast<status>(304)) {
         return empty_reply(std::make_unique<reply>(), e.get_status());

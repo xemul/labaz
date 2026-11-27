@@ -59,6 +59,20 @@ static std::optional<uint64_t> parse_offset(std::string_view s) {
     return v;
 }
 
+std::unique_ptr<http::reply> empty_reply(std::unique_ptr<http::reply> rep, http::reply::status_type st) {
+    rep->set_status(st);
+    return rep;
+}
+
+std::string_view url_path(const http::request& req) {
+    std::string_view url = req._url;
+    return url.substr(0, url.find('?'));
+}
+
+bool equals_ignoring_case(std::string_view a, std::string_view b) {
+    return std::ranges::equal(a, b, [] (char x, char y) { return std::tolower(x) == std::tolower(y); });
+}
+
 std::optional<byte_range> parse_range_header(std::string_view s) {
     if (!s.starts_with("bytes=") || s.find(',') != std::string_view::npos) {
         return std::nullopt;

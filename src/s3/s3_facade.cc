@@ -202,11 +202,6 @@ static std::unique_ptr<reply> xml_reply(std::unique_ptr<reply> rep, const xml_wr
     return rep;
 }
 
-static std::unique_ptr<reply> empty_reply(std::unique_ptr<reply> rep, status st) {
-    rep->set_status(st);
-    return rep;
-}
-
 //
 // Requests
 //
@@ -219,16 +214,6 @@ static std::optional<T> parse_number(std::string_view s) {
         return std::nullopt;
     }
     return v;
-}
-
-static bool equals_ignoring_case(std::string_view a, std::string_view b) {
-    return std::ranges::equal(a, b, [] (char x, char y) { return std::tolower(x) == std::tolower(y); });
-}
-
-// The part of the URL before the query.
-static std::string_view url_path(const request& req) {
-    std::string_view url = req._url;
-    return url.substr(0, url.find('?'));
 }
 
 static sstring bucket_param(const request& req) {
@@ -353,19 +338,6 @@ static void reject_headers(const request& req, std::initializer_list<std::string
     for (auto h : headers) {
         if (req._headers.contains(sstring(h))) {
             throw not_implemented(fmt::format("The '{}' header", h));
-        }
-    }
-}
-
-// Calls func(suffix, value) for every header named `prefix` (lower case)
-// followed by a non-empty suffix, with the suffix lower-cased.
-template <typename Func>
-static void for_each_prefixed_header(const request& req, std::string_view prefix, Func func) {
-    for (auto& [name, value] : req._headers) {
-        if (name.size() > prefix.size() && equals_ignoring_case(std::string_view(name).substr(0, prefix.size()), prefix)) {
-            sstring suffix = name.substr(prefix.size());
-            std::ranges::transform(suffix, suffix.begin(), [] (char c) { return std::tolower(c); });
-            func(suffix, value);
         }
     }
 }

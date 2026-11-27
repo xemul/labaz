@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -38,6 +40,29 @@ seastar::sstring iso8601_date(clock_type::time_point t);
 /// range. Returns nullopt for anything else, which HTTP lets a server
 /// ignore.
 std::optional<byte_range> parse_range_header(std::string_view header);
+
+/// A reply of the status and no body.
+std::unique_ptr<seastar::http::reply> empty_reply(std::unique_ptr<seastar::http::reply> rep,
+        seastar::http::reply::status_type st);
+
+/// The request's URL without the query.
+std::string_view url_path(const seastar::http::request& req);
+
+/// Compares as HTTP does header names, ASCII case-insensitively.
+bool equals_ignoring_case(std::string_view a, std::string_view b);
+
+/// Calls func(suffix, value) for every header named `prefix` (lower case)
+/// followed by a non-empty suffix, with the suffix lower-cased.
+template <typename Func>
+void for_each_prefixed_header(const seastar::http::request& req, std::string_view prefix, Func func) {
+    for (auto& [name, value] : req._headers) {
+        if (name.size() > prefix.size() && equals_ignoring_case(std::string_view(name).substr(0, prefix.size()), prefix)) {
+            seastar::sstring suffix = name.substr(prefix.size());
+            std::ranges::transform(suffix, suffix.begin(), [] (char c) { return std::tolower(c); });
+            func(suffix, value);
+        }
+    }
+}
 
 /// Milliseconds since `start`, for the trace logs.
 inline double ms_since(std::chrono::steady_clock::time_point start) {

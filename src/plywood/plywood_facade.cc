@@ -150,11 +150,6 @@ static std::unique_ptr<reply> error_reply(status st, std::string_view code, std:
     return rep;
 }
 
-static std::unique_ptr<reply> empty_reply(std::unique_ptr<reply> rep, status st = status::no_content) {
-    rep->set_status(st);
-    return rep;
-}
-
 //
 // Request helpers
 //
@@ -170,26 +165,10 @@ static sstring bucket_param(const request& req) {
 static sstring key_param(const request& req) {
     // The routes drop a trailing '/' from the path, but such keys are not
     // supported, so refuse them rather than store a different key.
-    std::string_view path = req._url;
-    if (path.substr(0, path.find('?')).ends_with('/')) {
+    if (url_path(req).ends_with('/')) {
         throw storage_error(errc::invalid_argument, "a key must not end with '/'");
     }
     return req.get_path_param("key");
-}
-
-// Calls func(suffix, value) for every header named `prefix` (lower case)
-// followed by a non-empty suffix, with the suffix lower-cased.
-template <typename Func>
-static void for_each_prefixed_header(const request& req, std::string_view prefix, Func func) {
-    for (auto& [name, value] : req._headers) {
-        if (name.size() > prefix.size()
-                && std::ranges::equal(std::string_view(name).substr(0, prefix.size()), prefix,
-                                      [] (char a, char b) { return std::tolower(a) == b; })) {
-            sstring suffix = name.substr(prefix.size());
-            std::ranges::transform(suffix, suffix.begin(), [] (char c) { return std::tolower(c); });
-            func(suffix, value);
-        }
-    }
 }
 
 static checksum_algorithm parse_checksum_algorithm(std::string_view name) {
@@ -428,7 +407,7 @@ private:
 
     future<std::unique_ptr<reply>> delete_bucket(request& req, std::unique_ptr<reply> rep) {
         co_await _storage.delete_bucket(bucket_param(req));
-        co_return empty_reply(std::move(rep));
+        co_return empty_reply(std::move(rep), status::no_content);
     }
 
     future<std::unique_ptr<reply>> list_objects(request& req, std::unique_ptr<reply> rep) {
@@ -550,7 +529,7 @@ private:
 
     future<std::unique_ptr<reply>> delete_object(request& req, std::unique_ptr<reply> rep) {
         co_await _storage.delete_object(bucket_param(req), key_param(req));
-        co_return empty_reply(std::move(rep));
+        co_return empty_reply(std::move(rep), status::no_content);
     }
 
     // Replaces the attributes the JSON body has: {"metadata": {}, "tags": {}}.
@@ -641,7 +620,7 @@ private:
     // Aborts the session.
     future<std::unique_ptr<reply>> delete_session(request& req, std::unique_ptr<reply> rep) {
         co_await _storage.abort_session(bucket_param(req), key_param(req), req.get_query_param("session"));
-        co_return empty_reply(std::move(rep));
+        co_return empty_reply(std::move(rep), status::no_content);
     }
 
     // Copies another object of the bucket, or a range of it, as a part.
