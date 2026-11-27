@@ -560,18 +560,28 @@ static std::optional<byte_range> range_from_headers(const request& req) {
 // Objects
 //
 
+// The checksum of the checksums of an object's parts, which is what S3 makes
+// of a multipart upload's; nullopt if some part has none of the algorithm.
+static std::optional<sstring> composite_checksum(const object_info& info, checksum_algorithm alg) {
+    checksummer sum({alg});
+    for (auto& p : info.parts) {
+        auto it = p.checksums.find(alg);
+        if (it == p.checksums.end()) {
+            return std::nullopt;
+        }
+        sum.update(it->second);
+    }
+    return std::move(sum.finish().at(alg));
+}
+
 // S3's ETag of an object: the MD5 of its data for a single upload, and the
 // MD5 of its parts' MD5s followed by the number of parts for a multipart
 // one. Objects without MD5s (written through other facades) get one made
 // of their generation.
 static sstring etag(const object_info& info) {
     if (info.upload == upload_kind::multipart) {
-        if (std::ranges::all_of(info.parts, [] (const part_info& p) { return p.checksums.contains(checksum_algorithm::md5); })) {
-            checksummer md5({checksum_algorithm::md5});
-            for (auto& p : info.parts) {
-                md5.update(p.checksums.at(checksum_algorithm::md5));
-            }
-            return sstring(fmt::format("\"{}-{}\"", to_hex(md5.finish().at(checksum_algorithm::md5)), info.parts.size()));
+        if (auto sum = composite_checksum(info, checksum_algorithm::md5)) {
+            return sstring(fmt::format("\"{}-{}\"", to_hex(*sum), info.parts.size()));
         }
     } else if (info.parts.size() <= 1) {
         auto sums = object_checksums(info);
@@ -626,15 +636,11 @@ struct s3_checksum {
 static std::optional<s3_checksum> object_checksum(const object_info& info) {
     auto alg = upload_algorithm(info.attrs.checksums);
     if (info.upload == upload_kind::multipart && is_composite(alg)) {
-        checksummer sum({alg});
-        for (auto& p : info.parts) {
-            auto it = p.checksums.find(alg);
-            if (it == p.checksums.end()) {
-                return std::nullopt;
-            }
-            sum.update(it->second);
+        auto sum = composite_checksum(info, alg);
+        if (!sum) {
+            return std::nullopt;
         }
-        return s3_checksum{alg, sstring(fmt::format("{}-{}", to_base64(sum.finish().at(alg)), info.parts.size())), true};
+        return s3_checksum{alg, sstring(fmt::format("{}-{}", to_base64(*sum), info.parts.size())), true};
     }
     auto sums = object_checksums(info);
     auto it = sums.find(alg);
