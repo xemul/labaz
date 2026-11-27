@@ -28,6 +28,16 @@ std::string_view to_string(errc e) {
     return "unknown";
 }
 
+bool is_storage_error(const std::exception_ptr& ep, errc code) {
+    try {
+        std::rethrow_exception(ep);
+    } catch (const storage_error& e) {
+        return e.code() == code;
+    } catch (...) {
+        return false;
+    }
+}
+
 resolved_range resolve_range(const byte_range& r, uint64_t size) {
     if (r.first) {
         if (*r.first >= size || (r.last && *r.last < *r.first)) {

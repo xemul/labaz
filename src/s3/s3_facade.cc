@@ -488,16 +488,6 @@ static upload_checksums upload_checksums_from_headers(const request& req) {
     return ret;
 }
 
-static bool is_storage_error(const std::exception_ptr& ep, errc code) {
-    try {
-        std::rethrow_exception(ep);
-    } catch (const storage_error& e) {
-        return e.code() == code;
-    } catch (...) {
-        return false;
-    }
-}
-
 // Request bodies must be plain: aws-chunked ones carry chunk signatures
 // and trailers.
 static void check_plain_body(const request& req) {

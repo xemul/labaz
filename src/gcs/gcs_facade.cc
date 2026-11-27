@@ -483,16 +483,6 @@ static void write_bucket(json_writer& w, const request& req, std::string_view bu
     w.EndObject();
 }
 
-static bool is_storage_error(const std::exception_ptr& ep, errc code) {
-    try {
-        std::rethrow_exception(ep);
-    } catch (const storage_error& e) {
-        return e.code() == code;
-    } catch (...) {
-        return false;
-    }
-}
-
 //
 // Handlers
 //

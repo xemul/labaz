@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -52,6 +53,9 @@ public:
     storage_error(errc code, const std::string& msg) : std::runtime_error(msg), _code(code) {}
     errc code() const noexcept { return _code; }
 };
+
+/// Whether the exception is a storage_error with the code.
+bool is_storage_error(const std::exception_ptr& ep, errc code);
 
 using user_metadata = std::map<sstring, sstring>;
 using object_tags = std::map<sstring, sstring>;
