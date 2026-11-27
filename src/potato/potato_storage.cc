@@ -47,6 +47,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/smp.hh>
@@ -115,6 +116,8 @@ static constexpr std::string_view session_prefix = "session.";
 static constexpr std::string_view part_prefix = "part.";
 // Bucket names do not start with a dot.
 static constexpr std::string_view staging_name = ".staging";
+// How many objects' metas a listing reads at once.
+static constexpr size_t list_concurrency = 32;
 
 [[noreturn]] static void fail(errc code, std::string msg) {
     throw storage_error(code, std::move(msg));
@@ -706,13 +709,13 @@ public:
         co_await d.close();
 
         listing ret;
-        for (auto& name : dirs) {
+        co_await max_concurrent_for_each(dirs, list_concurrency, [&] (const sstring& name) -> future<> {
             auto path = bucket_dir(bucket) / name.c_str() / meta_name;
             auto f = co_await coroutine::as_future(util::read_entire_file_contiguous(path));
             if (f.failed()) {
                 auto ep = f.get_exception();
                 if (is_enoent(ep)) {
-                    continue; // no committed version, or deleted meanwhile
+                    co_return; // no committed version, or deleted meanwhile
                 }
                 std::rethrow_exception(ep);
             }
@@ -720,7 +723,7 @@ public:
             if (info.key > start_after && info.key.starts_with(prefix)) {
                 ret.objects.push_back(std::move(info));
             }
-        }
+        });
         std::ranges::sort(ret.objects, {}, &object_info::key);
         ret.truncated = ret.objects.size() > max_keys;
         ret.objects.resize(std::min<size_t>(ret.objects.size(), max_keys));
